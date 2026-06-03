@@ -26,12 +26,14 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .awq_config import AWQConfig
     from .compressed_tensors_config import AscendCompressedTensorsConfig
+    from .gptq_config import GPTQConfig
     from .modelslim_config import AscendModelSlimConfig
 
 __all__ = [
     "AscendModelSlimConfig",
     "AWQConfig",
     "AscendCompressedTensorsConfig",
+    "GPTQConfig",
 ]
 
 
@@ -48,4 +50,8 @@ def __getattr__(name: str) -> Any:
         from .awq_config import AWQConfig
 
         return AWQConfig
+    if name == "GPTQConfig":
+        from .gptq_config import GPTQConfig
+
+        return GPTQConfig
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
