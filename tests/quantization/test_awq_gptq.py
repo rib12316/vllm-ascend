@@ -30,8 +30,22 @@ Usage (on NPU machine):
     pytest tests/quantization/test_awq_gptq.py -v -k gptq
 """
 
+import struct
+
 import pytest
 import torch
+
+
+def _to_int32_tensor(val):
+    """Convert an unsigned packed int32 value to a torch int32 tensor element.
+
+    Python ints are arbitrary precision, so a packed value like 0x80000000
+    exceeds the signed int32 range. We use struct.pack('I', ...) to handle
+    the unsigned→signed conversion correctly.
+    """
+    return torch.frombuffer(
+        struct.pack('I', val & 0xFFFFFFFF), dtype=torch.int32
+    ).reshape(())
 
 # ---------------------------------------------------------------------------
 # AWQ weight unpacking tests
@@ -69,7 +83,7 @@ class TestAWQWeightUnpack:
         # Pack values [1, 2, 3, 4, 5, 6, 7, 8] using AWQ interleaved order
         uint4_vals = [1, 2, 3, 4, 5, 6, 7, 8]
         packed_int32 = self._pack_awq_weight(uint4_vals)
-        weight = torch.tensor([[packed_int32]], dtype=torch.int32)
+        weight = _to_int32_tensor(packed_int32).reshape(1, 1)
 
         result = self.unpack_weight(weight, pack_factor=8)
         # Result should be a single int32 with values in standard order + XOR
@@ -133,7 +147,7 @@ class TestAWQWeightUnpack:
         packed_15 = 0
         for i in range(8):
             packed_15 |= (15 & 0xF) << (self.pack_order[i] * 4)
-        weight_15 = torch.tensor([[packed_15]], dtype=torch.int32)
+        weight_15 = _to_int32_tensor(packed_15).reshape(1, 1)
         result_15 = self.unpack_qzero(weight_15, torch.float32, pack_factor=8)
         assert torch.all(result_15 == -7.0), f"Expected -7.0 for zero-point 15, got {result_15}"
 
@@ -144,7 +158,7 @@ class TestAWQWeightUnpack:
             packed |= (8 & 0xF) << (self.pack_order[i] * 4)
 
         # MoE shape: (E, G, N_packed) e.g. (2, 3, 1)
-        weight = torch.full((2, 3, 1), packed, dtype=torch.int32)
+        weight = _to_int32_tensor(packed).reshape(1, 1).expand(2, 3, 1).contiguous().clone()
         result = self.unpack_qzero(weight, torch.float32, pack_factor=8, is_moe_layer=True)
 
         # -(8 - 8) = 0 for all positions
@@ -207,7 +221,7 @@ class TestGPTQWeightUnpack:
         values = [100, 200, 50, 155]
         packed = self._pack_gptq_weight(values, num_bits=8)
 
-        weight = torch.tensor([[packed]], dtype=torch.int32)
+        weight = _to_int32_tensor(packed).reshape(1, 1)
         result = self.unpack_qweight(weight, num_bits=8)
 
         # Result shape: (4, 1)
@@ -259,7 +273,7 @@ class TestGPTQWeightUnpack:
         values = [255, 255, 255, 255]
         packed = self._pack_gptq_weight(values, num_bits=8)
 
-        weight = torch.tensor([[packed]], dtype=torch.int32)
+        weight = _to_int32_tensor(packed).reshape(1, 1)
         result = self.unpack_qzeros(weight, num_bits=8, use_v2_format=False)
 
         assert result.dtype == torch.int32, f"Expected int32, got {result.dtype}"

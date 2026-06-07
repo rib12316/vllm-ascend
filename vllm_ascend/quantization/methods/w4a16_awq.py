@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch_npu
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -113,7 +114,7 @@ def _unpack_weight_from_int32(
     return weight_tmp.contiguous()
 
 
-class AscendW4A16AWQLinearMethod:
+class AscendW4A16AWQLinearMethod(QuantizeMethodBase):
     """Linear method for Ascend W4A16 AWQ quantization.
 
     This class delegates ``create_weights`` to vLLM's ``AWQLinearMethod``

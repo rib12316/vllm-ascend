@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch_npu
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -129,7 +130,7 @@ def _unpack_qzeros_from_int32(
     return unpacked
 
 
-class AscendGPTQLinearMethod:
+class AscendGPTQLinearMethod(QuantizeMethodBase):
     """Linear method for Ascend GPTQ quantization.
 
     This class delegates ``create_weights`` to vLLM's ``GPTQLinearMethod``
@@ -192,6 +193,11 @@ class AscendGPTQLinearMethod:
         4. For 4-bit: repack via npu_convert_weight_to_int4pack
         5. For 8-bit: use int8 directly
         """
+        # Save original output size before any transformation.
+        # GPTQ qweight is packed along dim=0: shape (K/pack_factor, N).
+        # The output dim N is qweight.shape[-1].
+        layer.gptq_output_size = layer.qweight.data.shape[-1]
+
         # --- desc_act handling ---
         if self.desc_act and hasattr(layer, "g_idx"):
             # Sort g_idx to get the permutation that orders weights by group
@@ -286,8 +292,10 @@ class AscendGPTQLinearMethod:
             antiquant_group_size=self.group_size,
             bias=bias,
         )
-        # Output size is the second dimension of the original qweight
-        out_shape = x.shape[:-1] + (qweight.shape[-1],)
+        # Output size is the original N dimension (saved before repacking).
+        # After int4pack, qweight.shape[-1] is N/8 for 4-bit, so we must
+        # use the saved gptq_output_size instead.
+        out_shape = x.shape[:-1] + (layer.gptq_output_size,)
         return out.reshape(out_shape)
 
 

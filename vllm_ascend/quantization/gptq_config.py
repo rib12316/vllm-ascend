@@ -147,26 +147,6 @@ class GPTQConfig(QuantizationConfig):
             quant_config=config,
         )
 
-    @classmethod
-    def override_quantization_method(
-        cls,
-        hf_quant_cfg: dict[str, Any],
-        user_quant: str | None = None,
-        hf_config: Any = None,
-    ) -> str | None:
-        """Prevent vLLM from auto-upgrading GPTQ to GPTQ-Marlin.
-
-        The upstream ``GPTQMarlinConfig.override_quantization_method`` would
-        return ``"gptq_marlin"`` for compatible models. Since Ascend NPU does
-        not support Marlin, we intercept and keep ``"gptq"``.
-
-        Args:
-            hf_quant_cfg: The checkpoint's quantization config dict.
-            user_quant: The user-specified quantization method string.
-            hf_config: The HuggingFace model config object (may be None).
-        """
-        return GPTQ_QUANTIZATION_METHOD
-
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
