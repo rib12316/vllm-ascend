@@ -32,14 +32,13 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch_npu
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 
-from .base import AscendMoEScheme, QuantType
+from .base import AscendLinearScheme, AscendMoEScheme, QuantType
 from .registry import register_scheme
 
 if TYPE_CHECKING:
@@ -114,55 +113,57 @@ def _unpack_weight_from_int32(
     return weight_tmp.contiguous()
 
 
-class AscendW4A16AWQLinearMethod(QuantizeMethodBase):
-    """Linear method for Ascend W4A16 AWQ quantization.
+@register_scheme("W4A16_AWQ", "linear")
+class AscendW4A16AWQLinearScheme(AscendLinearScheme):
+    """Linear scheme for Ascend W4A16 AWQ quantization (Pattern A).
 
-    This class delegates ``create_weights`` to vLLM's ``AWQLinearMethod``
-    (which creates qweight, qzeros, scales parameters with correct
-    PackedvLLMParameter types). It implements its own
-    ``process_weights_after_loading`` and ``apply`` to use Ascend NPU operators.
+    Uses autonomous weight registration via ``get_weight()`` /
+    ``get_pergroup_param()`` instead of delegating to vLLM's
+    ``AWQLinearMethod.create_weights()``.
 
-    The weight processing converts AWQ's uint4 packed weights into the signed
-    int4 format expected by ``npu_weight_quant_batchmatmul``, and unpacks
-    zero-points from int32 to bfloat16 for the same operator.
+    AWQ packs 4-bit weights along the output dimension (dim=1) with
+    interleaved bit order. qweight and qzeros share the same packing
+    convention (packed_dim=1, packed_factor=8), so both go in
+    ``get_weight()``. Only scales (no packing) go in
+    ``get_pergroup_param()``.
     """
 
     def __init__(self, quant_config: "AWQConfig"):
-        # Avoid importing vLLM's AWQLinearMethod at module level to prevent
-        # circular imports. We inherit from it lazily.
-        self.quant_config = quant_config
-        self.pack_factor = self.quant_config.pack_factor
-        self.group_size = self.quant_config.group_size
+        self.pack_factor = quant_config.pack_factor  # 32 // 4 = 8
+        self.group_size = quant_config.group_size
 
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        """Delegate weight creation to vLLM's AWQLinearMethod.
+    def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
+        """Return qweight and qzeros specifications.
 
-        This reuses vLLM's parameter creation (qweight, qzeros, scales) which
-        handles PackedvLLMParameter and GroupQuantScaleParameter correctly.
+        Both are packed along dim=1 (output dimension) with pack_factor=8.
         """
-        from vllm.model_executor.layers.quantization.awq import AWQLinearMethod
+        num_groups = input_size // self.group_size
+        return {
+            "qweight": torch.empty(
+                input_size, output_size // self.pack_factor, dtype=torch.int32
+            ),
+            "qzeros": torch.empty(
+                num_groups, output_size // self.pack_factor, dtype=torch.int32
+            ),
+            "_packed_dim": 1,
+            "_packed_factor": self.pack_factor,
+            "_param_dims": {
+                "qweight": {"input_dim": 0, "output_dim": 1},
+                "qzeros": {"input_dim": 0, "output_dim": 1},
+            },
+        }
 
-        # Create a vLLM AWQConfig-compatible shim that has the same attributes
-        # needed by AWQLinearMethod.create_weights.
-        vllm_method = AWQLinearMethod(self.quant_config)
-        vllm_method.create_weights(
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
-        )
+    def get_pergroup_param(
+        self, input_size: int, output_size: int, params_dtype: torch.dtype, layer_type: str | None = None
+    ) -> dict[str, Any]:
+        """Return scales specification (no packing, but needs custom dims)."""
+        num_groups = input_size // self.group_size
+        return {
+            "scales": torch.empty(num_groups, output_size, dtype=params_dtype),
+            "_param_dims": {
+                "scales": {"input_dim": 0, "output_dim": 1},
+            },
+        }
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert AWQ weights to NPU-compatible format after loading.
@@ -193,6 +194,7 @@ class AscendW4A16AWQLinearMethod(QuantizeMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        tp_rank: int | None = 0,
     ) -> torch.Tensor:
         """Forward pass using npu_weight_quant_batchmatmul.
 

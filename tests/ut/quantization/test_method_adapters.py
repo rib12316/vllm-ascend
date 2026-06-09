@@ -90,6 +90,83 @@ class TestAscendLinearMethod(TestBase):
         self.mock_scheme.apply.assert_called_once()
         self.assertEqual(output.shape, (4, 128))
 
+    @patch("vllm_ascend.quantization.method_adapters.enable_dsa_cp_with_layer_shard")
+    @patch("vllm_ascend.quantization.method_adapters.PerTensorScaleParameter")
+    def test_create_weights_with_custom_param_dims(self, mock_parameter, mock_enable_dsa):
+        """Test that _param_dims overrides default dims for weight params."""
+        mock_parameter.return_value = torch.nn.Parameter(torch.empty(1, 1, dtype=torch.int8), requires_grad=False)
+        mock_scheme = MagicMock(spec=AscendLinearScheme)
+        mock_scheme.get_weight.return_value = {
+            "qweight": torch.empty(256, 32, dtype=torch.int32),
+            "_packed_dim": 1,
+            "_packed_factor": 8,
+            "_param_dims": {
+                "qweight": {"input_dim": 0, "output_dim": 1},
+            },
+        }
+        mock_scheme.get_pertensor_param.return_value = {}
+        mock_scheme.get_perchannel_param.return_value = {}
+        mock_scheme.get_pergroup_param.return_value = {
+            "scales": torch.empty(2, 256, dtype=torch.bfloat16),
+            "_param_dims": {
+                "scales": {"input_dim": 0, "output_dim": 1},
+            },
+        }
+        method = AscendLinearMethod(mock_scheme)
+        layer = torch.nn.Module()
+        method.create_weights(
+            layer,
+            input_size_per_partition=256,
+            output_partition_sizes=[256],
+            input_size=256,
+            output_size=256,
+            params_dtype=torch.bfloat16,
+            weight_loader=MagicMock(),
+        )
+        # qweight should have overridden dims (input_dim=0, output_dim=1)
+        self.assertEqual(layer.qweight.input_dim, 0)
+        self.assertEqual(layer.qweight.output_dim, 1)
+        self.assertEqual(layer.qweight.packed_dim, 1)
+        self.assertEqual(layer.qweight.packed_factor, 8)
+        # scales should have overridden dims (input_dim=0, output_dim=1)
+        self.assertEqual(layer.scales.input_dim, 0)
+        self.assertEqual(layer.scales.output_dim, 1)
+
+    @patch("vllm_ascend.quantization.method_adapters.enable_dsa_cp_with_layer_shard")
+    @patch("vllm_ascend.quantization.method_adapters.PerTensorScaleParameter")
+    def test_create_weights_with_packed_pergroup_params(self, mock_parameter, mock_enable_dsa):
+        """Test that _packed_params applies packing to pergroup params."""
+        mock_parameter.return_value = torch.nn.Parameter(torch.empty(1, 1, dtype=torch.int8), requires_grad=False)
+        mock_scheme = MagicMock(spec=AscendLinearScheme)
+        mock_scheme.get_weight.return_value = {}
+        mock_scheme.get_pertensor_param.return_value = {}
+        mock_scheme.get_perchannel_param.return_value = {}
+        mock_scheme.get_pergroup_param.return_value = {
+            "qzeros": torch.empty(2, 32, dtype=torch.int32),
+            "_param_dims": {
+                "qzeros": {"input_dim": 0, "output_dim": 1},
+            },
+            "_packed_params": {
+                "qzeros": {"packed_dim": 1, "packed_factor": 8},
+            },
+        }
+        method = AscendLinearMethod(mock_scheme)
+        layer = torch.nn.Module()
+        method.create_weights(
+            layer,
+            input_size_per_partition=256,
+            output_partition_sizes=[256],
+            input_size=256,
+            output_size=256,
+            params_dtype=torch.bfloat16,
+            weight_loader=MagicMock(),
+        )
+        # qzeros should have custom dims and packing
+        self.assertEqual(layer.qzeros.input_dim, 0)
+        self.assertEqual(layer.qzeros.output_dim, 1)
+        self.assertEqual(layer.qzeros.packed_dim, 1)
+        self.assertEqual(layer.qzeros.packed_factor, 8)
+
 
 class TestAscendKVCacheMethod(TestBase):
     def setUp(self):

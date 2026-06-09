@@ -66,13 +66,22 @@ class AscendLinearMethod(LinearMethodBase):
         # Extract packing information (if present)
         packed_dim = weight_dict.pop("_packed_dim", None)
         packed_factor = weight_dict.pop("_packed_factor", None)
+        # Extract per-parameter dimension overrides (if present)
+        param_dims = weight_dict.pop("_param_dims", {})
+        # Extract set of param names that should NOT receive packing attrs
+        unpacked_params = weight_dict.pop("_unpacked_params", set())
 
         for weight_name, weight_param in weight_dict.items():
             param = torch.nn.Parameter(weight_param, requires_grad=False)
-            set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
+            dims = param_dims.get(weight_name, {"input_dim": 1, "output_dim": 0})
+            set_weight_attrs(param, dims)
 
-            # Set packing attributes if the weight is packed
-            if packed_dim is not None and packed_factor is not None:
+            # Set packing attributes only for params that are actually packed
+            if (
+                packed_dim is not None
+                and packed_factor is not None
+                and weight_name not in unpacked_params
+            ):
                 set_weight_attrs(param, {"packed_dim": packed_dim, "packed_factor": packed_factor})
 
             layer.register_parameter(weight_name, param)
@@ -105,9 +114,17 @@ class AscendLinearMethod(LinearMethodBase):
         pergroup_dict = self.quant_method.get_pergroup_param(
             input_size_per_partition, output_size_per_partition, params_dtype, layer_type=layer_type
         )
+        # Extract per-parameter dimension and packing overrides (if present)
+        pergroup_param_dims = pergroup_dict.pop("_param_dims", {})
+        pergroup_packed_params = pergroup_dict.pop("_packed_params", {})
+
         for pergroup_name, pergroup_param in pergroup_dict.items():
             param = torch.nn.Parameter(pergroup_param, requires_grad=False)
-            set_weight_attrs(param, {"output_dim": 0})
+            dims = pergroup_param_dims.get(pergroup_name, {"output_dim": 0})
+            set_weight_attrs(param, dims)
+            # Apply packing attributes if specified for this per-group param
+            if pergroup_name in pergroup_packed_params:
+                set_weight_attrs(param, pergroup_packed_params[pergroup_name])
             layer.register_parameter(pergroup_name, param)
             set_weight_attrs(param, extra_weight_attrs)
             if (

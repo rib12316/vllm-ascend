@@ -18,11 +18,13 @@
 """GPTQ quantization config for Ascend NPU.
 
 This config replaces vLLM's native ``GPTQConfig`` to route linear and MoE
-layers through Ascend-specific scheme implementations:
+layers through Ascend-specific scheme implementations (Pattern A):
 
-- **Linear layers** → ``AscendGPTQLinearMethod`` (delegates weight creation to
-  vLLM's ``GPTQLinearMethod``, overrides process/apply for NPU)
-- **MoE layers** → ``AscendW4A16GPTQFusedMoEMethod`` (registered scheme)
+- **Linear layers** → ``AscendW4A16GPTQLinearScheme`` or
+  ``AscendW8A16GPTQLinearScheme`` (registered via ``@register_scheme``,
+  dispatched through ``AscendLinearMethod`` adapter)
+- **MoE layers** → ``AscendW4A16GPTQFusedMoEMethod`` or
+  ``AscendW8A16GPTQFusedMoEMethod`` (registered schemes)
 - **Skipped layers** (e.g. lm_head) → ``AscendUnquantizedLinearMethod``
 
 Key differences from AWQ:
@@ -49,9 +51,8 @@ from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.utils import GPTQ_QUANTIZATION_METHOD
 
-from .method_adapters import AscendFusedMoEMethod
+from .method_adapters import AscendFusedMoEMethod, AscendLinearMethod
 from .methods import get_scheme_class
-from .methods.gptq import AscendGPTQLinearMethod
 
 
 @register_quantization_config(GPTQ_QUANTIZATION_METHOD)
@@ -91,7 +92,16 @@ class GPTQConfig(QuantizationConfig):
         self.checkpoint_format = checkpoint_format
         self.dynamic = dynamic or {}
         self.lm_head_quantized = lm_head_quantized
-        self.modules_in_block_to_quantize = modules_in_block_to_quantize or []
+        # Flatten nested list[list[str]] → list[str] (upstream does this in
+        # maybe_update_config which we haven't implemented; some models like
+        # TheBloke store modules_in_block_to_quantize as nested lists).
+        raw_modules = modules_in_block_to_quantize or []
+        if raw_modules and isinstance(raw_modules[0], list):
+            self.modules_in_block_to_quantize = [
+                item for sublist in raw_modules for item in sublist
+            ]
+        else:
+            self.modules_in_block_to_quantize = raw_modules
         self.autoround_version = autoround_version
 
         self.pack_factor = 32 // weight_bits
@@ -151,17 +161,39 @@ class GPTQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(
+            # Only check skip when modules_in_block_to_quantize is populated
+            # (requires maybe_update_config to have run). When empty, assume
+            # all Linear layers are quantized — matching upstream GPTQ behavior.
+            # Only skip when modules_in_block_to_quantize is populated AND
+            # this layer is NOT in the list (i.e., NOT quantized).
+            # Note: is_layer_skipped returns True when layer IS in the list,
+            # so we invert it: skip when the layer is NOT in the list.
+            if self.modules_in_block_to_quantize and not is_layer_skipped(
                 prefix,
                 self.modules_in_block_to_quantize,
                 self.packed_modules_mapping,
                 skip_with_substr=True,
             ):
                 return AscendUnquantizedLinearMethod()
-            return AscendGPTQLinearMethod(self)
+            # Pattern A: lookup scheme from registry and wrap with adapter
+            if self.weight_bits == 4:
+                scheme_name = "W4A16_GPTQ"
+            elif self.weight_bits == 8:
+                scheme_name = "W8A16_GPTQ"
+            else:
+                raise NotImplementedError(
+                    f"GPTQ with {self.weight_bits}-bit weights is not "
+                    f"supported on Ascend NPU."
+                )
+            scheme_cls = get_scheme_class(scheme_name, "linear")
+            if scheme_cls is None:
+                raise NotImplementedError(
+                    f"{scheme_name} linear scheme not found for layer {prefix}"
+                )
+            return AscendLinearMethod(scheme_cls(self))
 
         elif isinstance(layer, FusedMoE):
-            if is_layer_skipped(
+            if self.modules_in_block_to_quantize and is_layer_skipped(
                 prefix,
                 self.modules_in_block_to_quantize,
                 skip_with_substr=True,

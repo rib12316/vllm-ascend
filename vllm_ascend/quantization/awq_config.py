@@ -18,10 +18,10 @@
 """AWQ quantization config for Ascend NPU.
 
 This config replaces vLLM's native ``AWQConfig`` to route linear and MoE
-layers through Ascend-specific scheme implementations:
+layers through Ascend-specific scheme implementations (Pattern A):
 
-- **Linear layers** → ``AscendW4A16AWQLinearMethod`` (inherits vLLM's
-  ``AWQLinearMethod`` for weight creation, overrides process/apply for NPU)
+- **Linear layers** → ``AscendW4A16AWQLinearScheme`` (registered via
+  ``@register_scheme``, dispatched through ``AscendLinearMethod`` adapter)
 - **MoE layers** → ``AscendW4A16AWQFusedMoEMethod`` (registered scheme)
 - **Skipped layers** (e.g. lm_head) → ``AscendUnquantizedLinearMethod``
 """
@@ -39,9 +39,8 @@ from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.utils import AWQ_QUANTIZATION_METHOD
 
-from .method_adapters import AscendFusedMoEMethod
+from .method_adapters import AscendFusedMoEMethod, AscendLinearMethod
 from .methods import get_scheme_class
-from .methods.w4a16_awq import AscendW4A16AWQLinearMethod
 
 
 @register_quantization_config(AWQ_QUANTIZATION_METHOD)
@@ -112,7 +111,13 @@ class AWQConfig(QuantizationConfig):
                 skip_with_substr=True,
             ):
                 return AscendUnquantizedLinearMethod()
-            return AscendW4A16AWQLinearMethod(self)
+            # Pattern A: lookup scheme from registry and wrap with adapter
+            scheme_cls = get_scheme_class("W4A16_AWQ", "linear")
+            if scheme_cls is None:
+                raise NotImplementedError(
+                    f"W4A16_AWQ linear scheme not found for layer {prefix}"
+                )
+            return AscendLinearMethod(scheme_cls(self))
 
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(

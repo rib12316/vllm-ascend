@@ -31,6 +31,11 @@ Key differences from AWQ:
 Weight processing pipeline:
   4-bit: unpack (standard order) → subtract 8 → npu_convert_weight_to_int4pack
   8-bit: unpack (standard order) → subtract 128 → int8 direct use
+
+Architecture (Pattern A):
+  Linear schemes use autonomous weight registration via ``get_weight()`` /
+  ``get_pergroup_param()``. GPTQ's qweight is packed along dim=0 while qzeros
+  is packed along dim=1, so they must go in different ``get_*()`` methods.
 """
 
 from collections.abc import Callable
@@ -38,14 +43,13 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch_npu
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 
-from .base import AscendMoEScheme, QuantType
+from .base import AscendLinearScheme, AscendMoEScheme, QuantType
 from .registry import register_scheme
 
 if TYPE_CHECKING:
@@ -130,173 +134,278 @@ def _unpack_qzeros_from_int32(
     return unpacked
 
 
-class AscendGPTQLinearMethod(QuantizeMethodBase):
-    """Linear method for Ascend GPTQ quantization.
+def _get_gptq_linear_weight_spec(
+    input_size: int,
+    output_size: int,
+    pack_factor: int,
+) -> dict[str, Any]:
+    """Shared weight spec for both W4A16 and W8A16 GPTQ linear schemes.
 
-    This class delegates ``create_weights`` to vLLM's ``GPTQLinearMethod``
-    (which creates qweight, g_idx, qzeros, scales parameters with correct
-    PackedvLLMParameter types). It implements its own
-    ``process_weights_after_loading`` and ``apply`` to use Ascend NPU operators.
+    GPTQ qweight is packed along dim=0 (input dimension). g_idx is always
+    registered (even when desc_act=False) because GPTQ checkpoints always
+    contain g_idx tensors, and the weight_loader needs the parameter to
+    load them into.
+    """
+    return {
+        "qweight": torch.empty(
+            input_size // pack_factor, output_size, dtype=torch.int32
+        ),
+        "g_idx": torch.empty(input_size, dtype=torch.int32),
+        "_packed_dim": 0,
+        "_packed_factor": pack_factor,
+        "_param_dims": {
+            "qweight": {"input_dim": 0, "output_dim": 1},
+            "g_idx": {"input_dim": 0},
+        },
+        # g_idx is NOT packed — exclude it from receiving packed_dim/packed_factor
+        "_unpacked_params": {"g_idx"},
+    }
 
-    Weight processing:
-      - 4-bit: unpack → subtract 8 → ``npu_convert_weight_to_int4pack``
-      - 8-bit: unpack → subtract 128 → int8 direct use
-      - qzeros: unpack, adjust for v1/v2, convert to antiquant_offset
-      - desc_act: sort g_idx, shuffle qweight accordingly
+
+def _get_gptq_linear_pergroup_spec(
+    input_size: int,
+    output_size: int,
+    group_size: int,
+    pack_factor: int,
+    params_dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Shared pergroup param spec for both W4A16 and W8A16 GPTQ linear schemes.
+
+    GPTQ qzeros are packed along dim=1 (output dimension), which is different
+    from qweight's packing along dim=0. This is why qzeros must go in
+    ``get_pergroup_param()`` instead of ``get_weight()``.
+    """
+    num_groups = input_size // group_size
+    return {
+        "scales": torch.empty(num_groups, output_size, dtype=params_dtype),
+        "qzeros": torch.empty(
+            num_groups, output_size // pack_factor, dtype=torch.int32
+        ),
+        "_param_dims": {
+            "scales": {"input_dim": 0, "output_dim": 1},
+            "qzeros": {"input_dim": 0, "output_dim": 1},
+        },
+        "_packed_params": {
+            "qzeros": {"packed_dim": 1, "packed_factor": pack_factor},
+        },
+    }
+
+
+def _process_gptq_weights_after_loading(
+    layer: torch.nn.Module,
+    weight_bits: int,
+    desc_act: bool,
+    use_v2_format: bool,
+) -> None:
+    """Shared weight processing for both W4A16 and W8A16 GPTQ linear schemes.
+
+    Steps:
+    1. Handle desc_act: sort g_idx, shuffle qweight if needed
+    2. Unpack qweight from int32 to int8
+    3. Unpack qzeros, adjust for v1/v2, compute antiquant_offset
+    4. For 4-bit: repack via npu_convert_weight_to_int4pack
+    5. For 8-bit: use int8 directly
+    """
+    pack_factor = 32 // weight_bits
+
+    # Save original output size before any transformation.
+    # GPTQ qweight is packed along dim=0: shape (K/pack_factor, N).
+    # The output dim N is qweight.shape[-1].
+    layer.gptq_output_size = layer.qweight.data.shape[-1]
+
+    # --- desc_act handling ---
+    if desc_act and hasattr(layer, "g_idx"):
+        # Sort g_idx to get the permutation that orders weights by group
+        g_idx = layer.g_idx.data
+        perm = torch.argsort(g_idx).to(torch.int32)
+        layer.g_idx = torch.nn.Parameter(perm, requires_grad=False)
+
+        # Unpack first, then shuffle by permutation, then repack later.
+        # qweight shape: (K // pack_factor, N) — pack along dim=0
+        unpacked_qweight = _unpack_qweight_from_int32(
+            layer.qweight.data, weight_bits
+        )
+        # Apply permutation to the unpacked weight (dim=0 is the input dim)
+        unpacked_qweight = unpacked_qweight[perm]
+        layer.qweight.data = unpacked_qweight
+    else:
+        # No desc_act — just unpack
+        layer.qweight.data = _unpack_qweight_from_int32(
+            layer.qweight.data, weight_bits
+        )
+        if hasattr(layer, "g_idx"):
+            layer.g_idx = torch.nn.Parameter(
+                torch.empty((0,), dtype=torch.int32),
+                requires_grad=False,
+            )
+
+    # --- Repack weight for NPU ---
+    if weight_bits == 4:
+        # 4-bit: need npu_convert_weight_to_int4pack
+        # Weight is currently int8 (K, N), convert to int32 for packing
+        qweight_int32 = layer.qweight.data.to(torch.int32)
+        packed_qweight = torch_npu.npu_convert_weight_to_int4pack(
+            qweight_int32
+        )
+        layer.qweight = torch.nn.Parameter(
+            packed_qweight.contiguous(), requires_grad=False
+        )
+    else:
+        # 8-bit: int8 directly, view as int32 for batchmatmul
+        layer.qweight = torch.nn.Parameter(
+            layer.qweight.data.contiguous(), requires_grad=False
+        )
+
+    # --- Process qzeros → antiquant_offset ---
+    if hasattr(layer, "qzeros") and hasattr(layer, "scales"):
+        qzeros_int8 = _unpack_qzeros_from_int32(
+            layer.qzeros.data,
+            weight_bits,
+            use_v2_format,
+        )
+        # Convert qzeros to antiquant_offset in target dtype
+        # NPU formula: output = (weight + offset) * scale
+        # GPTQ formula: output = (weight - zeros) * scale
+        # Therefore: offset = -zeros (negated)
+        # But weight is already centered (uint→signed), so:
+        # The unpacked qweight has been centered by subtracting offset (8 or 128)
+        # The qzeros represent the zero-point in uint space.
+        # After centering: antiquant_offset = -(qzeros - center_offset)
+        center_offset = 1 << (weight_bits - 1)  # 8 for 4-bit, 128 for 8-bit
+        antiquant_offset = -(qzeros_int8.to(torch.float32) - center_offset)
+
+        layer.qzeros = torch.nn.Parameter(
+            antiquant_offset.to(layer.scales.data.dtype).contiguous(),
+            requires_grad=False,
+        )
+        layer.scales = torch.nn.Parameter(
+            layer.scales.data, requires_grad=False
+        )
+
+
+def _apply_gptq_linear(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+    group_size: int,
+) -> torch.Tensor:
+    """Shared apply for both W4A16 and W8A16 GPTQ linear schemes."""
+    qweight = layer.qweight
+    if bias is not None and bias.dtype == torch.bfloat16:
+        bias = bias.float()
+
+    reshaped_x = x.reshape(-1, x.shape[-1])
+
+    out = torch_npu.npu_weight_quant_batchmatmul(
+        reshaped_x,
+        qweight,
+        antiquant_scale=layer.scales,
+        antiquant_offset=layer.qzeros,
+        antiquant_group_size=group_size,
+        bias=bias,
+    )
+    # Output size is the original N dimension (saved before repacking).
+    # After int4pack, qweight.shape[-1] is N/8 for 4-bit, so we must
+    # use the saved gptq_output_size instead.
+    out_shape = x.shape[:-1] + (layer.gptq_output_size,)
+    return out.reshape(out_shape)
+
+
+@register_scheme("W4A16_GPTQ", "linear")
+class AscendW4A16GPTQLinearScheme(AscendLinearScheme):
+    """Linear scheme for Ascend W4A16 GPTQ quantization (4-bit, Pattern A).
+
+    Uses autonomous weight registration. GPTQ packs weights along dim=0
+    (input dimension) with standard sequential bit order. qweight is packed
+    along dim=0 but qzeros is packed along dim=1, so they go in different
+    ``get_*()`` methods.
     """
 
     def __init__(self, quant_config: "GPTQConfig"):
-        self.quant_config = quant_config
-        self.pack_factor = quant_config.pack_factor
+        self.weight_bits = 4
+        self.pack_factor = 32 // self.weight_bits  # 8
         self.group_size = quant_config.group_size
-        self.weight_bits = quant_config.weight_bits
         self.desc_act = quant_config.desc_act
         self.use_v2_format = quant_config.use_v2_format
 
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        """Delegate weight creation to vLLM's GPTQLinearMethod.
-
-        This reuses vLLM's parameter creation (qweight, g_idx, qzeros, scales)
-        which handles PackedvLLMParameter correctly.
-        """
-        from vllm.model_executor.layers.quantization.gptq import (
-            GPTQLinearMethod,
+    def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
+        """Return qweight and g_idx specifications."""
+        return _get_gptq_linear_weight_spec(
+            input_size, output_size, self.pack_factor
         )
 
-        vllm_method = GPTQLinearMethod(self.quant_config)
-        vllm_method.create_weights(
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
+    def get_pergroup_param(
+        self, input_size: int, output_size: int, params_dtype: torch.dtype, layer_type: str | None = None
+    ) -> dict[str, Any]:
+        """Return scales and qzeros specifications.
+
+        qzeros is packed along dim=1 (different from qweight's dim=0).
+        """
+        return _get_gptq_linear_pergroup_spec(
+            input_size, output_size, self.group_size, self.pack_factor, params_dtype
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Convert GPTQ weights to NPU-compatible format after loading.
-
-        Steps:
-        1. Handle desc_act: sort g_idx, shuffle qweight if needed
-        2. Unpack qweight from int32 to int8
-        3. Unpack qzeros, adjust for v1/v2, compute antiquant_offset
-        4. For 4-bit: repack via npu_convert_weight_to_int4pack
-        5. For 8-bit: use int8 directly
-        """
-        # Save original output size before any transformation.
-        # GPTQ qweight is packed along dim=0: shape (K/pack_factor, N).
-        # The output dim N is qweight.shape[-1].
-        layer.gptq_output_size = layer.qweight.data.shape[-1]
-
-        # --- desc_act handling ---
-        if self.desc_act and hasattr(layer, "g_idx"):
-            # Sort g_idx to get the permutation that orders weights by group
-            g_idx = layer.g_idx.data
-            perm = torch.argsort(g_idx).to(torch.int32)
-            layer.g_idx = torch.nn.Parameter(perm, requires_grad=False)
-
-            # Unpack first, then shuffle by permutation, then repack later.
-            # qweight shape: (K // pack_factor, N) — pack along dim=0
-            unpacked_qweight = _unpack_qweight_from_int32(
-                layer.qweight.data, self.weight_bits
-            )
-            # Apply permutation to the unpacked weight (dim=0 is the input dim)
-            unpacked_qweight = unpacked_qweight[perm]
-            layer.qweight.data = unpacked_qweight
-        else:
-            # No desc_act — just unpack
-            layer.qweight.data = _unpack_qweight_from_int32(
-                layer.qweight.data, self.weight_bits
-            )
-            if hasattr(layer, "g_idx"):
-                layer.g_idx = torch.nn.Parameter(
-                    torch.empty((0,), dtype=torch.int32),
-                    requires_grad=False,
-                )
-
-        # --- Repack weight for NPU ---
-        if self.weight_bits == 4:
-            # 4-bit: need npu_convert_weight_to_int4pack
-            # Weight is currently int8 (K, N), convert to int32 for packing
-            qweight_int32 = layer.qweight.data.to(torch.int32)
-            packed_qweight = torch_npu.npu_convert_weight_to_int4pack(
-                qweight_int32
-            )
-            layer.qweight = torch.nn.Parameter(
-                packed_qweight.contiguous(), requires_grad=False
-            )
-        else:
-            # 8-bit: int8 directly, view as int32 for batchmatmul
-            layer.qweight = torch.nn.Parameter(
-                layer.qweight.data.contiguous(), requires_grad=False
-            )
-
-        # --- Process qzeros → antiquant_offset ---
-        if hasattr(layer, "qzeros") and hasattr(layer, "scales"):
-            qzeros_int8 = _unpack_qzeros_from_int32(
-                layer.qzeros.data,
-                self.weight_bits,
-                self.use_v2_format,
-            )
-            # Convert qzeros to antiquant_offset in target dtype
-            # NPU formula: output = (weight + offset) * scale
-            # GPTQ formula: output = (weight - zeros) * scale
-            # Therefore: offset = -zeros (negated)
-            # But weight is already centered (uint→signed), so:
-            # The unpacked qweight has been centered by subtracting offset (8 or 128)
-            # The qzeros represent the zero-point in uint space.
-            # After centering: antiquant_offset = -(qzeros - center_offset)
-            center_offset = 1 << (self.weight_bits - 1)  # 8 for 4-bit, 128 for 8-bit
-            antiquant_offset = -(qzeros_int8.to(torch.float32) - center_offset)
-
-            layer.qzeros = torch.nn.Parameter(
-                antiquant_offset.to(layer.scales.data.dtype).contiguous(),
-                requires_grad=False,
-            )
-            layer.scales = torch.nn.Parameter(
-                layer.scales.data, requires_grad=False
-            )
+        """Convert GPTQ 4-bit weights to NPU-compatible format."""
+        _process_gptq_weights_after_loading(
+            layer, self.weight_bits, self.desc_act, self.use_v2_format
+        )
 
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        """Forward pass using npu_weight_quant_batchmatmul.
+        """Forward pass using npu_weight_quant_batchmatmul."""
+        return _apply_gptq_linear(layer, x, bias, self.group_size)
 
-        Dequantization is fused into the matrix multiplication:
-        ``output = (weight + offset) * scale @ x``
-        """
-        qweight = layer.qweight
-        if bias is not None and bias.dtype == torch.bfloat16:
-            bias = bias.float()
 
-        reshaped_x = x.reshape(-1, x.shape[-1])
+@register_scheme("W8A16_GPTQ", "linear")
+class AscendW8A16GPTQLinearScheme(AscendLinearScheme):
+    """Linear scheme for Ascend W8A16 GPTQ quantization (8-bit, Pattern A).
 
-        out = torch_npu.npu_weight_quant_batchmatmul(
-            reshaped_x,
-            qweight,
-            antiquant_scale=layer.scales,
-            antiquant_offset=layer.qzeros,
-            antiquant_group_size=self.group_size,
-            bias=bias,
+    8-bit GPTQ uses int8 weights directly without additional repacking.
+    Same structure as 4-bit but with pack_factor=4.
+    """
+
+    def __init__(self, quant_config: "GPTQConfig"):
+        self.weight_bits = 8
+        self.pack_factor = 32 // self.weight_bits  # 4
+        self.group_size = quant_config.group_size
+        self.desc_act = quant_config.desc_act
+        self.use_v2_format = quant_config.use_v2_format
+
+    def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
+        """Return qweight and g_idx specifications."""
+        return _get_gptq_linear_weight_spec(
+            input_size, output_size, self.pack_factor
         )
-        # Output size is the original N dimension (saved before repacking).
-        # After int4pack, qweight.shape[-1] is N/8 for 4-bit, so we must
-        # use the saved gptq_output_size instead.
-        out_shape = x.shape[:-1] + (layer.gptq_output_size,)
-        return out.reshape(out_shape)
+
+    def get_pergroup_param(
+        self, input_size: int, output_size: int, params_dtype: torch.dtype, layer_type: str | None = None
+    ) -> dict[str, Any]:
+        """Return scales and qzeros specifications."""
+        return _get_gptq_linear_pergroup_spec(
+            input_size, output_size, self.group_size, self.pack_factor, params_dtype
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Convert GPTQ 8-bit weights to NPU-compatible format."""
+        _process_gptq_weights_after_loading(
+            layer, self.weight_bits, self.desc_act, self.use_v2_format
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        tp_rank: int | None = 0,
+    ) -> torch.Tensor:
+        """Forward pass using npu_weight_quant_batchmatmul."""
+        return _apply_gptq_linear(layer, x, bias, self.group_size)
 
 
 @register_scheme("W4A16_GPTQ", "moe")

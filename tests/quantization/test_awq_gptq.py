@@ -466,24 +466,22 @@ class TestGPTQConfig:
         assert config.desc_act is False
         assert config.use_v2_format is True
 
-    def test_override_quantization_method(self):
-        """Verify Marlin interception returns 'gptq'."""
+    def test_override_quantization_method_not_defined(self):
+        """Verify we do NOT override quantization method (Bug #4 fix).
+
+        We deleted override_quantization_method to avoid vLLM v0.20.2's
+        override validation error. The upstream GPTQMarlinConfig already
+        handles the case where user_quant == "gptq" by returning None,
+        so Ascend-side interception is unnecessary.
+        """
         from vllm_ascend.quantization.gptq_config import GPTQConfig
 
-        result = GPTQConfig.override_quantization_method({}, "gptq")
-        assert result == "gptq"
-
-    def test_override_quantization_method_with_hf_config(self):
-        """Verify hf_config parameter is accepted (signature bug fix)."""
-        from vllm_ascend.quantization.gptq_config import GPTQConfig
-
-        # This should not raise TypeError
+        # The method should not exist on GPTQConfig itself
+        assert "override_quantization_method" not in GPTQConfig.__dict__
+        # Inherited from parent QuantizationConfig, returns None by default
         result = GPTQConfig.override_quantization_method(
-            {"quant_method": "gptq"},
-            user_quant=None,
-            hf_config={"model_type": "llama"},
-        )
-        assert result == "gptq"
+            {"quant_method": "gptq"}, "gptq")
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -519,12 +517,26 @@ class TestQuantTypeRegistry:
         cls = get_scheme_class("W8A16_GPTQ", "moe")
         assert cls is not None
 
-    def test_awq_linear_not_in_registry(self):
-        """AWQ Linear method is NOT in registry (directly instantiated by config)."""
+    def test_awq_linear_scheme_registered(self):
+        """AWQ Linear scheme is registered via Pattern A."""
         from vllm_ascend.quantization.methods.registry import get_scheme_class
 
         cls = get_scheme_class("W4A16_AWQ", "linear")
-        assert cls is None  # By design
+        assert cls is not None
+
+    def test_gptq_w4_linear_scheme_registered(self):
+        """GPTQ W4A16 Linear scheme is registered via Pattern A."""
+        from vllm_ascend.quantization.methods.registry import get_scheme_class
+
+        cls = get_scheme_class("W4A16_GPTQ", "linear")
+        assert cls is not None
+
+    def test_gptq_w8_linear_scheme_registered(self):
+        """GPTQ W8A16 Linear scheme is registered via Pattern A."""
+        from vllm_ascend.quantization.methods.registry import get_scheme_class
+
+        cls = get_scheme_class("W8A16_GPTQ", "linear")
+        assert cls is not None
 
 
 # ---------------------------------------------------------------------------
@@ -607,13 +619,15 @@ class TestNPUOperatorIntegration:
         """Test that npu_weight_quant_batchmatmul runs without error."""
         import torch_npu
 
-        # Create small test tensors
-        M, K_packed, N = 4, 8, 16
-        group_size = 4
-        K = K_packed * 8
+        # Weight layout for AWQ/GPTQ: (K, N_packed) where N_packed = N / 8.
+        # The operator checks x.shape[-1] (K) == weight.shape[0] (K).
+        # Constraint: group_size must be a multiple of 32 in [32, K-1].
+        M, K, N = 4, 256, 32
+        group_size = 64
+        N_packed = N // 8  # = 4
 
         x = torch.randn(M, K, dtype=torch.float16).npu()
-        qweight = torch.randint(0, 100, (K_packed, N), dtype=torch.int32).npu()
+        qweight = torch.randint(0, 100, (K, N_packed), dtype=torch.int32).npu()
         scale = torch.randn(K // group_size, N, dtype=torch.float16).npu()
         offset = torch.randn(K // group_size, N, dtype=torch.float16).npu()
 
@@ -624,7 +638,7 @@ class TestNPUOperatorIntegration:
             antiquant_group_size=group_size,
         )
 
-        assert out.shape == (M, N), f"Expected (4, 16), got {out.shape}"
+        assert out.shape == (M, N), f"Expected ({M}, {N}), got {out.shape}"
 
     def test_npu_convert_weight_to_int4pack_runs(self):
         """Test that npu_convert_weight_to_int4pack runs without error."""
