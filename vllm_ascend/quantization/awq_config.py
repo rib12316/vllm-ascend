@@ -26,14 +26,26 @@ layers through Ascend-specific scheme implementations (Pattern A):
 - **Skipped layers** (e.g. lm_head) → ``AscendUnquantizedLinearMethod``
 """
 
-from typing import Any, Union
+from typing import TYPE_CHECKING, Any, Union
 
 import torch
+from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization import register_quantization_config
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.transformers_utils.config import get_safetensors_params_metadata
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+    from vllm.model_executor.models.utils import WeightsMapper
+else:
+    PretrainedConfig = None
+    WeightsMapper = None
 
 from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
@@ -67,6 +79,13 @@ class AWQConfig(QuantizationConfig):
         self.zero_point = zero_point
         self.modules_to_not_convert = modules_to_not_convert or []
 
+        if self.group_size <= 0:
+            raise ValueError(
+                f"AWQ group_size must be a positive integer on Ascend NPU, "
+                f"but got {self.group_size}. Per-channel quantization "
+                f"(group_size=-1) is not supported because the NPU operator "
+                f"npu_weight_quant_batchmatmul requires a positive group_size."
+            )
         if self.weight_bits != 4:
             raise ValueError(
                 f"Currently, only 4-bit weight quantization is supported for AWQ, "
@@ -99,6 +118,47 @@ class AWQConfig(QuantizationConfig):
         zero_point = cls.get_from_keys(config, ["zero_point"])
         modules_to_not_convert = cls.get_from_keys_or(config, ["modules_to_not_convert"], None)
         return cls(weight_bits, group_size, zero_point, modules_to_not_convert, config)
+
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
+        """Translate HF module names in modules_to_not_convert to vLLM names.
+
+        Called by the model loader after the HF→vLLM name mapping is known,
+        so that skip-list entries match the vLLM parameter names used in
+        ``get_quant_method`` prefix checks.
+        """
+        if self.modules_to_not_convert:
+            self.modules_to_not_convert = hf_to_vllm_mapper.apply_list(
+                self.modules_to_not_convert
+            )
+
+    def maybe_update_config(
+        self,
+        model_name: str,
+        hf_config: "PretrainedConfig | None" = None,
+        revision: str | None = None,
+    ):
+        """Auto-detect unquantized layers from safetensors metadata.
+
+        When ``modules_to_not_convert`` is not explicitly provided in the
+        model config, this method inspects the safetensors parameter dtypes
+        to determine which layers are NOT quantized (i.e., stored in fp16/bf16/fp32).
+
+        Ported from upstream ``AWQConfig.maybe_update_config``
+        (vllm/vllm/.../quantization/awq.py).
+        """
+        if self.modules_to_not_convert:
+            return
+
+        unquant_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+        metadata = get_safetensors_params_metadata(model_name, revision=revision)
+        layers = {param_name.rsplit(".", 1)[0] for param_name in metadata}
+        quant_layers: set[str] = {
+            param_name.rsplit(".", 1)[0]
+            for param_name, info in metadata.items()
+            if (dtype := info.get("dtype", None))
+            and _SAFETENSORS_TO_TORCH_DTYPE[dtype] not in unquant_dtypes
+        }
+        self.modules_to_not_convert = list(layers - quant_layers)
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str

@@ -175,6 +175,11 @@ def _get_gptq_linear_pergroup_spec(
     from qweight's packing along dim=0. This is why qzeros must go in
     ``get_pergroup_param()`` instead of ``get_weight()``.
     """
+    if input_size % group_size != 0:
+        raise ValueError(
+            f"GPTQ input_size ({input_size}) must be divisible by "
+            f"group_size ({group_size})."
+        )
     num_groups = input_size // group_size
     return {
         "scales": torch.empty(num_groups, output_size, dtype=params_dtype),
@@ -470,13 +475,17 @@ class AscendW4A16GPTQFusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        assert intermediate_size_per_partition % self.group_size == 0, (
-            f"Expecting `intermediate_size_per_partition` {intermediate_size_per_partition} "
-            f"can be divided by `group_size` {self.group_size}"
-        )
-        assert hidden_sizes % self.group_size == 0, (
-            f"Expecting `hidden_sizes` {hidden_sizes} can be divided by `group_size` {self.group_size}"
-        )
+        if intermediate_size_per_partition % self.group_size != 0:
+            raise ValueError(
+                f"GPTQ MoE intermediate_size_per_partition "
+                f"({intermediate_size_per_partition}) must be divisible by "
+                f"group_size ({self.group_size})."
+            )
+        if hidden_sizes % self.group_size != 0:
+            raise ValueError(
+                f"GPTQ MoE hidden_sizes ({hidden_sizes}) must be divisible by "
+                f"group_size ({self.group_size})."
+            )
 
         param_dict = {}
         num_groups_w13 = hidden_sizes // self.group_size
@@ -712,13 +721,17 @@ class AscendW8A16GPTQFusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        assert intermediate_size_per_partition % self.group_size == 0, (
-            f"Expecting `intermediate_size_per_partition` {intermediate_size_per_partition} "
-            f"can be divided by `group_size` {self.group_size}"
-        )
-        assert hidden_sizes % self.group_size == 0, (
-            f"Expecting `hidden_sizes` {hidden_sizes} can be divided by `group_size` {self.group_size}"
-        )
+        if intermediate_size_per_partition % self.group_size != 0:
+            raise ValueError(
+                f"GPTQ MoE intermediate_size_per_partition "
+                f"({intermediate_size_per_partition}) must be divisible by "
+                f"group_size ({self.group_size})."
+            )
+        if hidden_sizes % self.group_size != 0:
+            raise ValueError(
+                f"GPTQ MoE hidden_sizes ({hidden_sizes}) must be divisible by "
+                f"group_size ({self.group_size})."
+            )
 
         param_dict = {}
         num_groups_w13 = hidden_sizes // self.group_size

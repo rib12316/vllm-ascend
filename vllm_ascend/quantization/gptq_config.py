@@ -35,9 +35,10 @@ Key differences from AWQ:
 - GPTQ supports both 4-bit and 8-bit weights
 """
 
-from typing import Any, Union
+from typing import TYPE_CHECKING, Any, Union
 
 import torch
+from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization import register_quantization_config
@@ -46,6 +47,19 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.transformers_utils.config import get_safetensors_params_metadata
+from vllm.utils.collection_utils import is_list_of
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        UnquantizedEmbeddingMethod,
+    )
+    from vllm.model_executor.models.utils import WeightsMapper
+else:
+    PretrainedConfig = None
+    WeightsMapper = None
 
 from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
@@ -86,22 +100,31 @@ class GPTQConfig(QuantizationConfig):
                 f"Currently, only 2/3/4/8-bit weight quantization is "
                 f"supported for GPTQ on Ascend, but got {weight_bits} bits."
             )
+        if weight_bits in (2, 3):
+            raise NotImplementedError(
+                f"GPTQ with {weight_bits}-bit weights is not yet supported on "
+                f"Ascend NPU. The NPU quantization kernels "
+                f"(npu_weight_quant_batchmatmul) only support 4-bit and 8-bit "
+                f"weight packing. Please use a 4-bit or 8-bit GPTQ model instead."
+            )
         self.weight_bits = weight_bits
+        if group_size <= 0:
+            raise ValueError(
+                f"GPTQ group_size must be a positive integer on Ascend NPU, "
+                f"but got {group_size}. Per-channel quantization "
+                f"(group_size=-1) is not supported because the NPU operator "
+                f"npu_weight_quant_batchmatmul requires a positive group_size."
+            )
         self.group_size = group_size
         self.desc_act = desc_act
         self.checkpoint_format = checkpoint_format
         self.dynamic = dynamic or {}
         self.lm_head_quantized = lm_head_quantized
-        # Flatten nested list[list[str]] → list[str] (upstream does this in
-        # maybe_update_config which we haven't implemented; some models like
-        # TheBloke store modules_in_block_to_quantize as nested lists).
-        raw_modules = modules_in_block_to_quantize or []
-        if raw_modules and isinstance(raw_modules[0], list):
-            self.modules_in_block_to_quantize = [
-                item for sublist in raw_modules for item in sublist
-            ]
-        else:
-            self.modules_in_block_to_quantize = raw_modules
+        # Stored as-is; flattening and auto-detection happen in
+        # maybe_update_config (port of upstream GPTQConfig.maybe_update_config).
+        # Some models (e.g. TheBloke) store nested list[list[str]] which
+        # maybe_update_config will flatten.
+        self.modules_in_block_to_quantize = modules_in_block_to_quantize or []
         self.autoround_version = autoround_version
 
         self.pack_factor = 32 // weight_bits
@@ -157,10 +180,74 @@ class GPTQConfig(QuantizationConfig):
             quant_config=config,
         )
 
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
+        """Translate HF module names in modules_in_block_to_quantize to vLLM names.
+
+        Called by the model loader after the HF→vLLM name mapping is known,
+        so that quantize-list entries match the vLLM parameter names used in
+        ``get_quant_method`` prefix checks.
+        """
+        if self.modules_in_block_to_quantize is not None:
+            self.modules_in_block_to_quantize = hf_to_vllm_mapper.apply_list(
+                self.modules_in_block_to_quantize
+            )
+
+    def maybe_update_config(
+        self,
+        model_name: str,
+        hf_config: "PretrainedConfig | None" = None,
+        revision: str | None = None,
+    ):
+        """Flatten nested modules_in_block_to_quantize and auto-detect quantized layers.
+
+        This is the Ascend port of upstream ``GPTQConfig.maybe_update_config``
+        (vllm/vllm/.../quantization/gptq.py:197-222).
+
+        Two-phase logic (matching upstream):
+        1. If ``modules_in_block_to_quantize`` is already populated, flatten
+           any nested ``list[list[str]]`` → ``list[str]`` (some models like
+           TheBloke store nested lists) and return.
+        2. If empty, auto-detect quantized layers by inspecting safetensors
+           metadata: any parameter whose dtype is NOT fp16/bf16/fp32 is
+           considered quantized.
+        """
+        if self.modules_in_block_to_quantize:
+            if is_list_of(self.modules_in_block_to_quantize, list):
+                # original modules_in_block_to_quantize: list[list[str]]
+                # flatten to list[str]
+                self.modules_in_block_to_quantize = [
+                    item
+                    for sublist in self.modules_in_block_to_quantize
+                    for item in sublist
+                ]
+            return
+
+        unquant_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+        metadata = get_safetensors_params_metadata(model_name, revision=revision)
+        quant_layers: set[str] = {
+            param_name.rsplit(".", 1)[0]
+            for param_name, info in metadata.items()
+            if (dtype := info.get("dtype", None))
+            and _SAFETENSORS_TO_TORCH_DTYPE[dtype] not in unquant_dtypes
+        }
+        self.modules_in_block_to_quantize = list(quant_layers)
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
-        if isinstance(layer, LinearBase):
+        # Handle lm_head: ParallelLMHead is NOT a LinearBase subclass,
+        # so we must explicitly check it when lm_head_quantized=True.
+        # Upstream does this in get_linear_quant_method (gptq_utils.py).
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            ParallelLMHead,
+            UnquantizedEmbeddingMethod,
+        )
+
+        parallel_lm_head_quantized = (
+            isinstance(layer, ParallelLMHead) and self.lm_head_quantized
+        )
+
+        if isinstance(layer, LinearBase) or parallel_lm_head_quantized:
             # Only check skip when modules_in_block_to_quantize is populated
             # (requires maybe_update_config to have run). When empty, assume
             # all Linear layers are quantized — matching upstream GPTQ behavior.
@@ -174,6 +261,8 @@ class GPTQConfig(QuantizationConfig):
                 self.packed_modules_mapping,
                 skip_with_substr=True,
             ):
+                if parallel_lm_head_quantized:
+                    return UnquantizedEmbeddingMethod()
                 return AscendUnquantizedLinearMethod()
             # Pattern A: lookup scheme from registry and wrap with adapter
             if self.weight_bits == 4:
@@ -193,7 +282,7 @@ class GPTQConfig(QuantizationConfig):
             return AscendLinearMethod(scheme_cls(self))
 
         elif isinstance(layer, FusedMoE):
-            if self.modules_in_block_to_quantize and is_layer_skipped(
+            if self.modules_in_block_to_quantize and not is_layer_skipped(
                 prefix,
                 self.modules_in_block_to_quantize,
                 skip_with_substr=True,

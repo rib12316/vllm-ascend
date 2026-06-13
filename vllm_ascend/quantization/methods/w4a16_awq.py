@@ -137,6 +137,11 @@ class AscendW4A16AWQLinearScheme(AscendLinearScheme):
 
         Both are packed along dim=1 (output dimension) with pack_factor=8.
         """
+        if input_size % self.group_size != 0:
+            raise ValueError(
+                f"AWQ input_size ({input_size}) must be divisible by "
+                f"group_size ({self.group_size})."
+            )
         num_groups = input_size // self.group_size
         return {
             "qweight": torch.empty(
@@ -157,6 +162,11 @@ class AscendW4A16AWQLinearScheme(AscendLinearScheme):
         self, input_size: int, output_size: int, params_dtype: torch.dtype, layer_type: str | None = None
     ) -> dict[str, Any]:
         """Return scales specification (no packing, but needs custom dims)."""
+        if input_size % self.group_size != 0:
+            raise ValueError(
+                f"AWQ input_size ({input_size}) must be divisible by "
+                f"group_size ({self.group_size})."
+            )
         num_groups = input_size // self.group_size
         return {
             "scales": torch.empty(num_groups, output_size, dtype=params_dtype),
@@ -274,13 +284,17 @@ class AscendW4A16AWQFusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        assert intermediate_size_per_partition % self.group_size == 0, (
-            f"Expecting `intermediate_size_per_partition` {intermediate_size_per_partition} "
-            f"can be divided by `group_size` {self.group_size}"
-        )
-        assert hidden_sizes % self.group_size == 0, (
-            f"Expecting `hidden_sizes` {hidden_sizes} can be divided by `group_size` {self.group_size}"
-        )
+        if intermediate_size_per_partition % self.group_size != 0:
+            raise ValueError(
+                f"AWQ MoE intermediate_size_per_partition "
+                f"({intermediate_size_per_partition}) must be divisible by "
+                f"group_size ({self.group_size})."
+            )
+        if hidden_sizes % self.group_size != 0:
+            raise ValueError(
+                f"AWQ MoE hidden_sizes ({hidden_sizes}) must be divisible by "
+                f"group_size ({self.group_size})."
+            )
 
         param_dict = {}
         num_groups_w13 = hidden_sizes // self.group_size
