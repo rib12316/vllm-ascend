@@ -522,6 +522,17 @@ class AscendW4A16GPTQFusedMoEMethod(AscendMoEScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert GPTQ MoE weights to NPU-compatible format."""
+        # desc_act (activation ordering) is not supported for MoE: the MoE
+        # weight registration does not load per-expert g_idx, so there is no
+        # permutation to apply. Fail loud rather than silently producing wrong
+        # output. See Linear scheme (_process_gptq_weights_after_loading) for
+        # the desc_act implementation that MoE would need to mirror.
+        if self.desc_act:
+            raise NotImplementedError(
+                "GPTQ MoE with desc_act=True is not yet supported on Ascend "
+                "NPU: per-expert g_idx reordering is not implemented. Please "
+                "use a GPTQ MoE model with desc_act=False."
+            )
         # Process w13 (gate_up)
         w13_qweight_unpacked = _unpack_qweight_from_int32(
             layer.w13_qweight.data.flatten(0, 1),
@@ -766,6 +777,13 @@ class AscendW8A16GPTQFusedMoEMethod(AscendMoEScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert 8-bit GPTQ MoE weights to NPU-compatible format."""
+        # desc_act not supported for MoE — see W4A16 MoE for the rationale.
+        if self.desc_act:
+            raise NotImplementedError(
+                "GPTQ MoE with desc_act=True is not yet supported on Ascend "
+                "NPU: per-expert g_idx reordering is not implemented. Please "
+                "use a GPTQ MoE model with desc_act=False."
+            )
         # Process w13 (gate_up)
         w13_qweight_unpacked = _unpack_qweight_from_int32(
             layer.w13_qweight.data.flatten(0, 1),
