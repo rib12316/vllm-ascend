@@ -254,13 +254,15 @@ class AscendW4A16AWQFusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        assert intermediate_size_per_partition % self.pack_factor == 0, (
-            f"Expecting `intermediate_size_per_partition` {intermediate_size_per_partition} "
-            f"can be divided by `pack_factor` {self.pack_factor}"
-        )
-        assert hidden_sizes % self.pack_factor == 0, (
-            f"Expecting `hidden_sizes` {hidden_sizes} can be divided by `pack_factor` {self.pack_factor}"
-        )
+        if intermediate_size_per_partition % self.pack_factor != 0:
+            raise ValueError(
+                f"Expecting `intermediate_size_per_partition` {intermediate_size_per_partition} "
+                f"can be divided by `pack_factor` {self.pack_factor}"
+            )
+        if hidden_sizes % self.pack_factor != 0:
+            raise ValueError(
+                f"Expecting `hidden_sizes` {hidden_sizes} can be divided by `pack_factor` {self.pack_factor}"
+            )
 
         param_dict = {}
         param_dict["w13_qweight"] = torch.empty(
@@ -397,7 +399,8 @@ class AscendW4A16AWQFusedMoEMethod(AscendMoEScheme):
         mc2_mask: torch.Tensor | None = None,
         tid2eid: Any | None = None,
     ) -> torch.Tensor:
-        assert activation == "silu", "Only SiLU activation is supported."
+        if activation != "silu":
+            raise ValueError("Only SiLU activation is supported for Ascend AWQ MoE.")
 
         topk_weights, topk_ids = select_experts(
             hidden_states=x,

@@ -101,29 +101,33 @@ def _unpack_qzeros_from_int32(
 ) -> torch.Tensor:
     """Unpack GPTQ zero-points (qzeros) from packed int32.
 
-    GPTQ qzeros are packed along dim=1 (output_dim) with standard order.
+    GPTQ qzeros are packed along the LAST dim (output_dim) with standard
+    order. Supports any number of leading dims: a 2-D ``(G, N // pf)``
+    tensor (Linear) yields ``(G, N)``; a 3-D ``(E, G, N // pf)`` tensor
+    (MoE) yields ``(E, G, N)``.
 
     For v1 format: unpacked values need ``+1`` adjustment.
     For v2 format: use as-is.
 
     Args:
-        weight: Packed int32 tensor of shape ``(G, N // pack_factor)``.
+        weight: Packed int32 tensor whose last dim is ``N // pack_factor``.
         num_bits: Bits per element (4 or 8).
         use_v2_format: True if checkpoint_format == "gptq_v2".
 
     Returns:
-        Unpacked zero-points tensor in int8 dtype.
+        Unpacked zero-points tensor in int32 dtype (leading dims preserved).
     """
     pack_factor = 32 // num_bits
     mask = (1 << num_bits) - 1
-    G, N_packed = weight.shape
+    lead_shape = weight.shape[:-1]
+    N_packed = weight.shape[-1]
     N = N_packed * pack_factor
 
     unpacked = torch.zeros(
-        (G, N), device=weight.device, dtype=torch.int32
+        (*lead_shape, N), device=weight.device, dtype=torch.int32
     )
     for i in range(pack_factor):
-        unpacked[:, i::pack_factor] = (weight >> (num_bits * i)) & mask
+        unpacked[..., i::pack_factor] = (weight >> (num_bits * i)) & mask
 
     # v1 format: qzeros were stored with an implicit +1 offset
     if not use_v2_format:
@@ -442,13 +446,15 @@ class AscendW4A16GPTQFusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        assert intermediate_size_per_partition % self.pack_factor == 0, (
-            f"Expecting `intermediate_size_per_partition` {intermediate_size_per_partition} "
-            f"can be divided by `pack_factor` {self.pack_factor}"
-        )
-        assert hidden_sizes % self.pack_factor == 0, (
-            f"Expecting `hidden_sizes` {hidden_sizes} can be divided by `pack_factor` {self.pack_factor}"
-        )
+        if intermediate_size_per_partition % self.pack_factor != 0:
+            raise ValueError(
+                f"Expecting `intermediate_size_per_partition` {intermediate_size_per_partition} "
+                f"can be divided by `pack_factor` {self.pack_factor}"
+            )
+        if hidden_sizes % self.pack_factor != 0:
+            raise ValueError(
+                f"Expecting `hidden_sizes` {hidden_sizes} can be divided by `pack_factor` {self.pack_factor}"
+            )
 
         param_dict = {}
         # GPTQ MoE: qweight packed along input_dim (dim=0)
@@ -533,45 +539,49 @@ class AscendW4A16GPTQFusedMoEMethod(AscendMoEScheme):
                 "NPU: per-expert g_idx reordering is not implemented. Please "
                 "use a GPTQ MoE model with desc_act=False."
             )
-        # Process w13 (gate_up)
+        # Process w13 (gate_up).
+        # GPTQ stores w13_qweight packed along the input dim: (E, H//pf, 2*IN).
+        # Unpack along the input dim → (E, H, 2*IN), which is ALREADY the NPU MoE
+        # layout (input-first, like a transposed linear weight). Then pack the
+        # OUTPUT dim (2*IN) via int4pack → (E, H, 2*IN//pf).
+        #
+        # NOTE: no transpose here. AWQ/W4A16 transpose in their post-processing
+        # only because they store the weight output-first ((E, 2*IN, H//pf));
+        # GPTQ stores it input-first, so unpack already lands on (E, H, 2*IN).
         w13_qweight_unpacked = _unpack_qweight_from_int32(
             layer.w13_qweight.data.flatten(0, 1),
             self.weight_bits,
         ).view(layer.w13_qweight.data.shape[0], -1, layer.w13_qweight.data.shape[2])
-        # Transpose: (E, K, 2*IN) → (E, 2*IN, K) for NPU MoE format
-        w13_qweight_transposed = w13_qweight_unpacked.transpose(1, 2).contiguous().int()
-        # Repack for NPU: npu_convert_weight_to_int4pack expects (E*2*IN, K) int32
         w13_packed = torch_npu.npu_convert_weight_to_int4pack(
-            w13_qweight_transposed.flatten(0, 1)
+            w13_qweight_unpacked.flatten(0, 1).int()
         )
         layer.register_parameter(
             "w13_qweight",
             torch.nn.Parameter(
                 w13_packed.view(
                     layer.w13_qweight.data.shape[0],
-                    2 * (layer.w13_qweight.data.shape[1]),
+                    layer.w13_qweight.data.shape[1] * self.pack_factor,
                     -1,
                 ),
                 requires_grad=False,
             ),
         )
 
-        # Process w2 (down_proj)
+        # Process w2 (down_proj): (E, IN//pf, H) → unpack → (E, IN, H) →
+        # pack OUTPUT dim (H) → (E, IN, H//pf).
         w2_qweight_unpacked = _unpack_qweight_from_int32(
             layer.w2_qweight.data.flatten(0, 1),
             self.weight_bits,
         ).view(layer.w2_qweight.data.shape[0], -1, layer.w2_qweight.data.shape[2])
-        # Transpose: (E, IN, H) → (E, H, IN) for NPU MoE format
-        w2_qweight_transposed = w2_qweight_unpacked.transpose(1, 2).contiguous().int()
         w2_packed = torch_npu.npu_convert_weight_to_int4pack(
-            w2_qweight_transposed.flatten(0, 1)
+            w2_qweight_unpacked.flatten(0, 1).int()
         )
         layer.register_parameter(
             "w2_qweight",
             torch.nn.Parameter(
                 w2_packed.view(
                     layer.w2_qweight.data.shape[0],
-                    layer.w2_qweight.data.shape[2],
+                    layer.w2_qweight.data.shape[1] * self.pack_factor,
                     -1,
                 ),
                 requires_grad=False,
@@ -631,7 +641,8 @@ class AscendW4A16GPTQFusedMoEMethod(AscendMoEScheme):
         mc2_mask: torch.Tensor | None = None,
         tid2eid: Any | None = None,
     ) -> torch.Tensor:
-        assert activation == "silu", "Only SiLU activation is supported."
+        if activation != "silu":
+            raise ValueError("Only SiLU activation is supported for Ascend GPTQ MoE.")
 
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -702,13 +713,15 @@ class AscendW8A16GPTQFusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        assert intermediate_size_per_partition % self.pack_factor == 0, (
-            f"Expecting `intermediate_size_per_partition` {intermediate_size_per_partition} "
-            f"can be divided by `pack_factor` {self.pack_factor}"
-        )
-        assert hidden_sizes % self.pack_factor == 0, (
-            f"Expecting `hidden_sizes` {hidden_sizes} can be divided by `pack_factor` {self.pack_factor}"
-        )
+        if intermediate_size_per_partition % self.pack_factor != 0:
+            raise ValueError(
+                f"Expecting `intermediate_size_per_partition` {intermediate_size_per_partition} "
+                f"can be divided by `pack_factor` {self.pack_factor}"
+            )
+        if hidden_sizes % self.pack_factor != 0:
+            raise ValueError(
+                f"Expecting `hidden_sizes` {hidden_sizes} can be divided by `pack_factor` {self.pack_factor}"
+            )
 
         param_dict = {}
         param_dict["w13_qweight"] = torch.empty(
@@ -784,40 +797,32 @@ class AscendW8A16GPTQFusedMoEMethod(AscendMoEScheme):
                 "NPU: per-expert g_idx reordering is not implemented. Please "
                 "use a GPTQ MoE model with desc_act=False."
             )
-        # Process w13 (gate_up)
+        # Process w13 (gate_up).
+        # Same input-first layout as 4-bit: (E, H//pf, 2*IN) → unpack → (E, H, 2*IN).
+        # 8-bit has no int4pack repack — 4 int8 are packed into one int32 by
+        # viewing the last (output) dim as int32: (E, H, 2*IN) int8 → (E, H, 2*IN//pf) int32.
         w13_qweight_unpacked = _unpack_qweight_from_int32(
             layer.w13_qweight.data.flatten(0, 1),
             self.weight_bits,
         ).view(layer.w13_qweight.data.shape[0], -1, layer.w13_qweight.data.shape[2])
-        # Transpose: (E, K, 2*IN) → (E, 2*IN, K) for NPU MoE format
-        # 8-bit: view as int32 directly (4 int8 per int32)
-        w13_transposed = w13_qweight_unpacked.transpose(1, 2).contiguous()
         layer.register_parameter(
             "w13_qweight",
             torch.nn.Parameter(
-                w13_transposed.view(
-                    layer.w13_qweight.data.shape[0],
-                    2 * (layer.w13_qweight.data.shape[1]),
-                    -1,
-                ).view(torch.int32).contiguous(),
+                w13_qweight_unpacked.contiguous().view(torch.int32),
                 requires_grad=False,
             ),
         )
 
-        # Process w2 (down_proj)
+        # Process w2 (down_proj): (E, IN//pf, H) → unpack → (E, IN, H) →
+        # view as int32 → (E, IN, H//pf) int32.
         w2_qweight_unpacked = _unpack_qweight_from_int32(
             layer.w2_qweight.data.flatten(0, 1),
             self.weight_bits,
         ).view(layer.w2_qweight.data.shape[0], -1, layer.w2_qweight.data.shape[2])
-        w2_transposed = w2_qweight_unpacked.transpose(1, 2).contiguous()
         layer.register_parameter(
             "w2_qweight",
             torch.nn.Parameter(
-                w2_transposed.view(
-                    layer.w2_qweight.data.shape[0],
-                    layer.w2_qweight.data.shape[2],
-                    -1,
-                ).view(torch.int32).contiguous(),
+                w2_qweight_unpacked.contiguous().view(torch.int32),
                 requires_grad=False,
             ),
         )
@@ -875,7 +880,8 @@ class AscendW8A16GPTQFusedMoEMethod(AscendMoEScheme):
         mc2_mask: torch.Tensor | None = None,
         tid2eid: Any | None = None,
     ) -> torch.Tensor:
-        assert activation == "silu", "Only SiLU activation is supported."
+        if activation != "silu":
+            raise ValueError("Only SiLU activation is supported for Ascend GPTQ MoE.")
 
         topk_weights, topk_ids = select_experts(
             hidden_states=x,

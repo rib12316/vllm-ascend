@@ -220,3 +220,6 @@ csrc/third_party/
 .claude/skills/*
 
 .codegraph/
+# Local CANN installs / download artifacts (not part of repo)
+usr/
+csrc/build_out/
