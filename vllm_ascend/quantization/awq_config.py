@@ -88,8 +88,7 @@ class AWQConfig(QuantizationConfig):
             )
         if self.weight_bits != 4:
             raise ValueError(
-                f"Currently, only 4-bit weight quantization is supported for AWQ, "
-                f"but got {self.weight_bits} bits."
+                f"Currently, only 4-bit weight quantization is supported for AWQ, but got {self.weight_bits} bits."
             )
         self.pack_factor = 32 // self.weight_bits
 
@@ -127,9 +126,7 @@ class AWQConfig(QuantizationConfig):
         ``get_quant_method`` prefix checks.
         """
         if self.modules_to_not_convert:
-            self.modules_to_not_convert = hf_to_vllm_mapper.apply_list(
-                self.modules_to_not_convert
-            )
+            self.modules_to_not_convert = hf_to_vllm_mapper.apply_list(self.modules_to_not_convert)
 
     def maybe_update_config(
         self,
@@ -155,8 +152,7 @@ class AWQConfig(QuantizationConfig):
         quant_layers: set[str] = {
             param_name.rsplit(".", 1)[0]
             for param_name, info in metadata.items()
-            if (dtype := info.get("dtype", None))
-            and _SAFETENSORS_TO_TORCH_DTYPE[dtype] not in unquant_dtypes
+            if (dtype := info.get("dtype", None)) and _SAFETENSORS_TO_TORCH_DTYPE[dtype] not in unquant_dtypes
         }
         self.modules_to_not_convert = list(layers - quant_layers)
 
@@ -174,9 +170,7 @@ class AWQConfig(QuantizationConfig):
             # Pattern A: lookup scheme from registry and wrap with adapter
             scheme_cls = get_scheme_class("W4A16_AWQ", "linear")
             if scheme_cls is None:
-                raise NotImplementedError(
-                    f"W4A16_AWQ linear scheme not found for layer {prefix}"
-                )
+                raise NotImplementedError(f"W4A16_AWQ linear scheme not found for layer {prefix}")
             return AscendLinearMethod(scheme_cls(self))
 
         elif isinstance(layer, FusedMoE):

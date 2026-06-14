@@ -36,6 +36,10 @@ Architecture (Pattern A):
   Linear schemes use autonomous weight registration via ``get_weight()`` /
   ``get_pergroup_param()``. GPTQ's qweight is packed along dim=0 while qzeros
   is packed along dim=1, so they must go in different ``get_*()`` methods.
+
+  MoE schemes share a single base class (``_AscendGPTQFusedMoEMethodBase``):
+  the 4-bit and 8-bit variants differ ONLY in the weight repack step
+  (``npu_convert_weight_to_int4pack`` vs ``int32`` storage view).
 """
 
 from collections.abc import Callable
@@ -81,9 +85,7 @@ def _unpack_qweight_from_int32(
     K_packed, N = weight.shape
     K = K_packed * pack_factor
 
-    unpacked = torch.zeros(
-        (K, N), device=weight.device, dtype=torch.int32
-    )
+    unpacked = torch.zeros((K, N), device=weight.device, dtype=torch.int32)
     for i in range(pack_factor):
         unpacked[i::pack_factor, :] = (weight >> (num_bits * i)) & mask
 
@@ -123,9 +125,7 @@ def _unpack_qzeros_from_int32(
     N_packed = weight.shape[-1]
     N = N_packed * pack_factor
 
-    unpacked = torch.zeros(
-        (*lead_shape, N), device=weight.device, dtype=torch.int32
-    )
+    unpacked = torch.zeros((*lead_shape, N), device=weight.device, dtype=torch.int32)
     for i in range(pack_factor):
         unpacked[..., i::pack_factor] = (weight >> (num_bits * i)) & mask
 
@@ -151,9 +151,7 @@ def _get_gptq_linear_weight_spec(
     load them into.
     """
     return {
-        "qweight": torch.empty(
-            input_size // pack_factor, output_size, dtype=torch.int32
-        ),
+        "qweight": torch.empty(input_size // pack_factor, output_size, dtype=torch.int32),
         "g_idx": torch.empty(input_size, dtype=torch.int32),
         "_packed_dim": 0,
         "_packed_factor": pack_factor,
@@ -180,16 +178,11 @@ def _get_gptq_linear_pergroup_spec(
     ``get_pergroup_param()`` instead of ``get_weight()``.
     """
     if input_size % group_size != 0:
-        raise ValueError(
-            f"GPTQ input_size ({input_size}) must be divisible by "
-            f"group_size ({group_size})."
-        )
+        raise ValueError(f"GPTQ input_size ({input_size}) must be divisible by group_size ({group_size}).")
     num_groups = input_size // group_size
     return {
         "scales": torch.empty(num_groups, output_size, dtype=params_dtype),
-        "qzeros": torch.empty(
-            num_groups, output_size // pack_factor, dtype=torch.int32
-        ),
+        "qzeros": torch.empty(num_groups, output_size // pack_factor, dtype=torch.int32),
         "_param_dims": {
             "scales": {"input_dim": 0, "output_dim": 1},
             "qzeros": {"input_dim": 0, "output_dim": 1},
@@ -215,8 +208,6 @@ def _process_gptq_weights_after_loading(
     4. For 4-bit: repack via npu_convert_weight_to_int4pack
     5. For 8-bit: use int8 directly
     """
-    pack_factor = 32 // weight_bits
-
     # Save original output size before any transformation.
     # GPTQ qweight is packed along dim=0: shape (K/pack_factor, N).
     # The output dim N is qweight.shape[-1].
@@ -231,17 +222,13 @@ def _process_gptq_weights_after_loading(
 
         # Unpack first, then shuffle by permutation, then repack later.
         # qweight shape: (K // pack_factor, N) — pack along dim=0
-        unpacked_qweight = _unpack_qweight_from_int32(
-            layer.qweight.data, weight_bits
-        )
+        unpacked_qweight = _unpack_qweight_from_int32(layer.qweight.data, weight_bits)
         # Apply permutation to the unpacked weight (dim=0 is the input dim)
         unpacked_qweight = unpacked_qweight[perm]
         layer.qweight.data = unpacked_qweight
     else:
         # No desc_act — just unpack
-        layer.qweight.data = _unpack_qweight_from_int32(
-            layer.qweight.data, weight_bits
-        )
+        layer.qweight.data = _unpack_qweight_from_int32(layer.qweight.data, weight_bits)
         if hasattr(layer, "g_idx"):
             layer.g_idx = torch.nn.Parameter(
                 torch.empty((0,), dtype=torch.int32),
@@ -253,17 +240,11 @@ def _process_gptq_weights_after_loading(
         # 4-bit: need npu_convert_weight_to_int4pack
         # Weight is currently int8 (K, N), convert to int32 for packing
         qweight_int32 = layer.qweight.data.to(torch.int32)
-        packed_qweight = torch_npu.npu_convert_weight_to_int4pack(
-            qweight_int32
-        )
-        layer.qweight = torch.nn.Parameter(
-            packed_qweight.contiguous(), requires_grad=False
-        )
+        packed_qweight = torch_npu.npu_convert_weight_to_int4pack(qweight_int32)
+        layer.qweight = torch.nn.Parameter(packed_qweight.contiguous(), requires_grad=False)
     else:
         # 8-bit: int8 directly, view as int32 for batchmatmul
-        layer.qweight = torch.nn.Parameter(
-            layer.qweight.data.contiguous(), requires_grad=False
-        )
+        layer.qweight = torch.nn.Parameter(layer.qweight.data.contiguous(), requires_grad=False)
 
     # --- Process qzeros → antiquant_offset ---
     if hasattr(layer, "qzeros") and hasattr(layer, "scales"):
@@ -287,9 +268,7 @@ def _process_gptq_weights_after_loading(
             antiquant_offset.to(layer.scales.data.dtype).contiguous(),
             requires_grad=False,
         )
-        layer.scales = torch.nn.Parameter(
-            layer.scales.data, requires_grad=False
-        )
+        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
 
 def _apply_gptq_linear(
@@ -339,9 +318,7 @@ class AscendW4A16GPTQLinearScheme(AscendLinearScheme):
 
     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
         """Return qweight and g_idx specifications."""
-        return _get_gptq_linear_weight_spec(
-            input_size, output_size, self.pack_factor
-        )
+        return _get_gptq_linear_weight_spec(input_size, output_size, self.pack_factor)
 
     def get_pergroup_param(
         self, input_size: int, output_size: int, params_dtype: torch.dtype, layer_type: str | None = None
@@ -350,15 +327,11 @@ class AscendW4A16GPTQLinearScheme(AscendLinearScheme):
 
         qzeros is packed along dim=1 (different from qweight's dim=0).
         """
-        return _get_gptq_linear_pergroup_spec(
-            input_size, output_size, self.group_size, self.pack_factor, params_dtype
-        )
+        return _get_gptq_linear_pergroup_spec(input_size, output_size, self.group_size, self.pack_factor, params_dtype)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert GPTQ 4-bit weights to NPU-compatible format."""
-        _process_gptq_weights_after_loading(
-            layer, self.weight_bits, self.desc_act, self.use_v2_format
-        )
+        _process_gptq_weights_after_loading(layer, self.weight_bits, self.desc_act, self.use_v2_format)
 
     def apply(
         self,
@@ -388,23 +361,17 @@ class AscendW8A16GPTQLinearScheme(AscendLinearScheme):
 
     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
         """Return qweight and g_idx specifications."""
-        return _get_gptq_linear_weight_spec(
-            input_size, output_size, self.pack_factor
-        )
+        return _get_gptq_linear_weight_spec(input_size, output_size, self.pack_factor)
 
     def get_pergroup_param(
         self, input_size: int, output_size: int, params_dtype: torch.dtype, layer_type: str | None = None
     ) -> dict[str, Any]:
         """Return scales and qzeros specifications."""
-        return _get_gptq_linear_pergroup_spec(
-            input_size, output_size, self.group_size, self.pack_factor, params_dtype
-        )
+        return _get_gptq_linear_pergroup_spec(input_size, output_size, self.group_size, self.pack_factor, params_dtype)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert GPTQ 8-bit weights to NPU-compatible format."""
-        _process_gptq_weights_after_loading(
-            layer, self.weight_bits, self.desc_act, self.use_v2_format
-        )
+        _process_gptq_weights_after_loading(layer, self.weight_bits, self.desc_act, self.use_v2_format)
 
     def apply(
         self,
@@ -417,23 +384,204 @@ class AscendW8A16GPTQLinearScheme(AscendLinearScheme):
         return _apply_gptq_linear(layer, x, bias, self.group_size)
 
 
-@register_scheme("W4A16_GPTQ", "moe")
-class AscendW4A16GPTQFusedMoEMethod(AscendMoEScheme):
-    """FusedMoE method for Ascend W4A16 GPTQ quantization (4-bit).
+# ---------------------------------------------------------------------------
+# Shared MoE helpers — W4A16 and W8A16 GPTQ MoE differ ONLY in the weight
+# repack step (_repack_gptq_moe_qweight); every other concern is identical.
+# ---------------------------------------------------------------------------
 
-    GPTQ MoE weights use **standard sequential packing** along the output
-    dimension (same as the storage format for MoE). The ``apply`` method
-    delegates to the unified ``moe_comm_method.fused_experts`` pipeline,
-    passing the GPTQ-specific scale and offset tensors.
+
+def _get_gptq_moe_weight_spec(
+    num_experts: int,
+    intermediate_size_per_partition: int,
+    hidden_sizes: int,
+    pack_factor: int,
+) -> dict[str, Any]:
+    """Shared weight spec for W4A16 and W8A16 GPTQ MoE schemes.
+
+    GPTQ MoE ``qweight`` is packed along the input dim (dim=1 of the 3-D
+    expert tensor), identical for both bit-widths:
+      - w13 (gate_up): ``(E, H // pack_factor, 2 * IN)``
+      - w2  (down_proj): ``(E, IN // pack_factor, H)``
+    """
+    if intermediate_size_per_partition % pack_factor != 0:
+        raise ValueError(
+            f"Expecting `intermediate_size_per_partition` "
+            f"{intermediate_size_per_partition} can be divided by "
+            f"`pack_factor` {pack_factor}"
+        )
+    if hidden_sizes % pack_factor != 0:
+        raise ValueError(f"Expecting `hidden_sizes` {hidden_sizes} can be divided by `pack_factor` {pack_factor}")
+    return {
+        "w13_qweight": torch.empty(
+            num_experts,
+            hidden_sizes // pack_factor,
+            2 * intermediate_size_per_partition,
+            dtype=torch.int32,
+        ),
+        "w2_qweight": torch.empty(
+            num_experts,
+            intermediate_size_per_partition // pack_factor,
+            hidden_sizes,
+            dtype=torch.int32,
+        ),
+    }
+
+
+def _get_gptq_moe_quant_param(
+    num_experts: int,
+    intermediate_size_per_partition: int,
+    hidden_sizes: int,
+    group_size: int,
+    pack_factor: int,
+    params_dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Shared per-group quant param spec (scales + packed qzeros) for MoE.
+
+    qzeros are packed along the output dim (last dim), same as the linear path.
+    """
+    if intermediate_size_per_partition % group_size != 0:
+        raise ValueError(
+            f"GPTQ MoE intermediate_size_per_partition "
+            f"({intermediate_size_per_partition}) must be divisible by "
+            f"group_size ({group_size})."
+        )
+    if hidden_sizes % group_size != 0:
+        raise ValueError(f"GPTQ MoE hidden_sizes ({hidden_sizes}) must be divisible by group_size ({group_size}).")
+    num_groups_w13 = hidden_sizes // group_size
+    num_groups_w2 = intermediate_size_per_partition // group_size
+    return {
+        "w13_scales": torch.empty(
+            num_experts,
+            num_groups_w13,
+            2 * intermediate_size_per_partition,
+            dtype=params_dtype,
+        ),
+        "w2_scales": torch.empty(num_experts, num_groups_w2, hidden_sizes, dtype=params_dtype),
+        "w13_qzeros": torch.empty(
+            num_experts,
+            num_groups_w13,
+            2 * intermediate_size_per_partition // pack_factor,
+            dtype=torch.int32,
+        ),
+        "w2_qzeros": torch.empty(
+            num_experts,
+            num_groups_w2,
+            hidden_sizes // pack_factor,
+            dtype=torch.int32,
+        ),
+    }
+
+
+def _repack_gptq_moe_qweight(
+    qweight_data: torch.Tensor,
+    weight_bits: int,
+    pack_factor: int,
+) -> torch.Tensor:
+    """Unpack a GPTQ MoE qweight (packed along the input dim) and repack it into
+    the NPU MoE weight layout consumed by ``fused_experts``.
+
+    GPTQ stores ``{w13,w2}_qweight`` packed along the input dim. Unpacking lands
+    directly on the NPU's expected input-first layout ``(E, K, N)`` — no
+    transpose is needed (unlike AWQ, which stores output-first and transposes in
+    post-processing).
+
+    The two bit-widths differ ONLY in how the *output* dim is re-stored:
+      - 4-bit: repack via ``npu_convert_weight_to_int4pack`` → ``(E, K, N // 8)``
+      - 8-bit: view 4 consecutive int8 as one int32 → ``(E, K, N // 4)``
+
+    This is the single branch where W4A16 and W8A16 diverge.
+    """
+    unpacked = _unpack_qweight_from_int32(qweight_data.flatten(0, 1), weight_bits).view(
+        qweight_data.shape[0], -1, qweight_data.shape[2]
+    )
+    if weight_bits == 4:
+        packed = torch_npu.npu_convert_weight_to_int4pack(unpacked.flatten(0, 1).int())
+        return packed.view(
+            qweight_data.shape[0],
+            qweight_data.shape[1] * pack_factor,
+            -1,
+        )
+    # 8-bit: keep int8, view as int32 for grouped_matmul storage.
+    return unpacked.contiguous().view(torch.int32)
+
+
+def _process_gptq_moe_weights_after_loading(
+    layer: torch.nn.Module,
+    weight_bits: int,
+    pack_factor: int,
+    desc_act: bool,
+    use_v2_format: bool,
+) -> None:
+    """Shared weight processing for W4A16 and W8A16 GPTQ MoE schemes.
+
+    desc_act (activation ordering) is not supported for MoE: the MoE weight
+    registration does not load per-expert g_idx, so there is no permutation to
+    apply. Fail loud rather than silently producing wrong output. See the
+    Linear scheme (``_process_gptq_weights_after_loading``) for the desc_act
+    implementation that MoE would need to mirror.
+
+    For each expert weight (w13 = gate_up, w2 = down_proj):
+      1. Repack qweight for the NPU (see ``_repack_gptq_moe_qweight``).
+      2. Convert qzeros → antiquant_offset = -(zp - center_offset).
+    """
+    if desc_act:
+        raise NotImplementedError(
+            "GPTQ MoE with desc_act=True is not yet supported on Ascend "
+            "NPU: per-expert g_idx reordering is not implemented. Please "
+            "use a GPTQ MoE model with desc_act=False."
+        )
+
+    center_offset = 1 << (weight_bits - 1)  # 8 for 4-bit, 128 for 8-bit
+    for prefix in ("w13", "w2"):
+        # 1. Repack weight for the NPU (int4pack for 4-bit, int32 view for 8-bit).
+        repacked = _repack_gptq_moe_qweight(
+            getattr(layer, f"{prefix}_qweight").data,
+            weight_bits,
+            pack_factor,
+        )
+        layer.register_parameter(
+            f"{prefix}_qweight",
+            torch.nn.Parameter(repacked, requires_grad=False),
+        )
+        # 2. qzeros → antiquant_offset.
+        #    NPU: out = (w + offset) * scale;  GPTQ: out = (w - zeros) * scale
+        #    ⟹ offset = -(zeros - center_offset). center cancels the uint→signed
+        #    shift already applied to the weight in _unpack_qweight_from_int32.
+        qzeros = _unpack_qzeros_from_int32(
+            getattr(layer, f"{prefix}_qzeros").data,
+            weight_bits,
+            use_v2_format,
+        )
+        offset = -(qzeros.to(torch.float32) - center_offset)
+        scales_dtype = getattr(layer, f"{prefix}_scales").data.dtype
+        layer.register_parameter(
+            f"{prefix}_qzeros",
+            torch.nn.Parameter(offset.to(scales_dtype).contiguous(), requires_grad=False),
+        )
+
+
+class _AscendGPTQFusedMoEMethodBase(AscendMoEScheme):
+    """Shared GPTQ MoE implementation for Ascend NPU (4-bit and 8-bit).
+
+    Subclasses set two class attributes and inherit the full weight-spec /
+    weight-processing / ``apply`` pipeline:
+      - ``quant_type``: the :class:`QuantType` used to route through
+        ``fused_experts``.
+      - ``weight_bits``: 4 or 8 — drives ``pack_factor`` and the single
+        bit-width branch in ``_repack_gptq_moe_qweight``.
+
+    The ``apply`` method delegates to the unified ``fused_experts`` pipeline,
+    passing the GPTQ-specific scale (``{w13,w2}_scales``) and antiquant_offset
+    (``{w13,w2}_qzeros``) tensors.
     """
 
-    quant_type: QuantType = QuantType.W4A16_GPTQ
+    quant_type: QuantType = QuantType.NONE
+    weight_bits: int = 0  # set by subclass
     weight_attrs: dict = {"is_transposed": True}
 
     def __init__(self, quant_config: "GPTQConfig"):
         self.quant_config = quant_config
-        self.weight_bits = 4
-        self.pack_factor = 32 // self.weight_bits  # 8
+        self.pack_factor = 32 // self.weight_bits
         self.group_size = quant_config.group_size
         self.desc_act = quant_config.desc_act
         self.use_v2_format = quant_config.use_v2_format
@@ -446,33 +594,12 @@ class AscendW4A16GPTQFusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        if intermediate_size_per_partition % self.pack_factor != 0:
-            raise ValueError(
-                f"Expecting `intermediate_size_per_partition` {intermediate_size_per_partition} "
-                f"can be divided by `pack_factor` {self.pack_factor}"
-            )
-        if hidden_sizes % self.pack_factor != 0:
-            raise ValueError(
-                f"Expecting `hidden_sizes` {hidden_sizes} can be divided by `pack_factor` {self.pack_factor}"
-            )
-
-        param_dict = {}
-        # GPTQ MoE: qweight packed along input_dim (dim=0)
-        # w13: gate_up, shape (E, K // pack_factor, 2*IN)
-        # After unpack: (E, K, 2*IN), after transpose: (E, 2*IN, K // pack_factor)
-        param_dict["w13_qweight"] = torch.empty(
+        return _get_gptq_moe_weight_spec(
             num_experts,
-            hidden_sizes // self.pack_factor,
-            2 * intermediate_size_per_partition,
-            dtype=torch.int32,
-        )
-        param_dict["w2_qweight"] = torch.empty(
-            num_experts,
-            intermediate_size_per_partition // self.pack_factor,
+            intermediate_size_per_partition,
             hidden_sizes,
-            dtype=torch.int32,
+            self.pack_factor,
         )
-        return param_dict
 
     def get_dynamic_quant_param(
         self,
@@ -481,138 +608,23 @@ class AscendW4A16GPTQFusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
-        if intermediate_size_per_partition % self.group_size != 0:
-            raise ValueError(
-                f"GPTQ MoE intermediate_size_per_partition "
-                f"({intermediate_size_per_partition}) must be divisible by "
-                f"group_size ({self.group_size})."
-            )
-        if hidden_sizes % self.group_size != 0:
-            raise ValueError(
-                f"GPTQ MoE hidden_sizes ({hidden_sizes}) must be divisible by "
-                f"group_size ({self.group_size})."
-            )
-
-        param_dict = {}
-        num_groups_w13 = hidden_sizes // self.group_size
-        num_groups_w2 = intermediate_size_per_partition // self.group_size
-
-        # Scales
-        param_dict["w13_scales"] = torch.empty(
+        return _get_gptq_moe_quant_param(
             num_experts,
-            num_groups_w13,
-            2 * intermediate_size_per_partition,
-            dtype=params_dtype,
-        )
-        param_dict["w2_scales"] = torch.empty(
-            num_experts,
-            num_groups_w2,
+            intermediate_size_per_partition,
             hidden_sizes,
-            dtype=params_dtype,
+            self.group_size,
+            self.pack_factor,
+            params_dtype,
         )
-
-        # Zero-points (packed int32)
-        param_dict["w13_qzeros"] = torch.empty(
-            num_experts,
-            num_groups_w13,
-            2 * intermediate_size_per_partition // self.pack_factor,
-            dtype=torch.int32,
-        )
-        param_dict["w2_qzeros"] = torch.empty(
-            num_experts,
-            num_groups_w2,
-            hidden_sizes // self.pack_factor,
-            dtype=torch.int32,
-        )
-        return param_dict
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Convert GPTQ MoE weights to NPU-compatible format."""
-        # desc_act (activation ordering) is not supported for MoE: the MoE
-        # weight registration does not load per-expert g_idx, so there is no
-        # permutation to apply. Fail loud rather than silently producing wrong
-        # output. See Linear scheme (_process_gptq_weights_after_loading) for
-        # the desc_act implementation that MoE would need to mirror.
-        if self.desc_act:
-            raise NotImplementedError(
-                "GPTQ MoE with desc_act=True is not yet supported on Ascend "
-                "NPU: per-expert g_idx reordering is not implemented. Please "
-                "use a GPTQ MoE model with desc_act=False."
-            )
-        # Process w13 (gate_up).
-        # GPTQ stores w13_qweight packed along the input dim: (E, H//pf, 2*IN).
-        # Unpack along the input dim → (E, H, 2*IN), which is ALREADY the NPU MoE
-        # layout (input-first, like a transposed linear weight). Then pack the
-        # OUTPUT dim (2*IN) via int4pack → (E, H, 2*IN//pf).
-        #
-        # NOTE: no transpose here. AWQ/W4A16 transpose in their post-processing
-        # only because they store the weight output-first ((E, 2*IN, H//pf));
-        # GPTQ stores it input-first, so unpack already lands on (E, H, 2*IN).
-        w13_qweight_unpacked = _unpack_qweight_from_int32(
-            layer.w13_qweight.data.flatten(0, 1),
+        _process_gptq_moe_weights_after_loading(
+            layer,
             self.weight_bits,
-        ).view(layer.w13_qweight.data.shape[0], -1, layer.w13_qweight.data.shape[2])
-        w13_packed = torch_npu.npu_convert_weight_to_int4pack(
-            w13_qweight_unpacked.flatten(0, 1).int()
-        )
-        layer.register_parameter(
-            "w13_qweight",
-            torch.nn.Parameter(
-                w13_packed.view(
-                    layer.w13_qweight.data.shape[0],
-                    layer.w13_qweight.data.shape[1] * self.pack_factor,
-                    -1,
-                ),
-                requires_grad=False,
-            ),
-        )
-
-        # Process w2 (down_proj): (E, IN//pf, H) → unpack → (E, IN, H) →
-        # pack OUTPUT dim (H) → (E, IN, H//pf).
-        w2_qweight_unpacked = _unpack_qweight_from_int32(
-            layer.w2_qweight.data.flatten(0, 1),
-            self.weight_bits,
-        ).view(layer.w2_qweight.data.shape[0], -1, layer.w2_qweight.data.shape[2])
-        w2_packed = torch_npu.npu_convert_weight_to_int4pack(
-            w2_qweight_unpacked.flatten(0, 1).int()
-        )
-        layer.register_parameter(
-            "w2_qweight",
-            torch.nn.Parameter(
-                w2_packed.view(
-                    layer.w2_qweight.data.shape[0],
-                    layer.w2_qweight.data.shape[1] * self.pack_factor,
-                    -1,
-                ),
-                requires_grad=False,
-            ),
-        )
-
-        # Process qzeros → antiquant_offset
-        center_offset = 1 << (self.weight_bits - 1)  # 8 for 4-bit
-
-        w13_qzeros_unpacked = _unpack_qzeros_from_int32(
-            layer.w13_qzeros.data, self.weight_bits, self.use_v2_format
-        )
-        w13_offset = -(w13_qzeros_unpacked.to(torch.float32) - center_offset)
-        layer.register_parameter(
-            "w13_qzeros",
-            torch.nn.Parameter(
-                w13_offset.to(layer.w13_scales.data.dtype).contiguous(),
-                requires_grad=False,
-            ),
-        )
-
-        w2_qzeros_unpacked = _unpack_qzeros_from_int32(
-            layer.w2_qzeros.data, self.weight_bits, self.use_v2_format
-        )
-        w2_offset = -(w2_qzeros_unpacked.to(torch.float32) - center_offset)
-        layer.register_parameter(
-            "w2_qzeros",
-            torch.nn.Parameter(
-                w2_offset.to(layer.w2_scales.data.dtype).contiguous(),
-                requires_grad=False,
-            ),
+            self.pack_factor,
+            self.desc_act,
+            self.use_v2_format,
         )
 
     def apply(
@@ -685,242 +697,30 @@ class AscendW4A16GPTQFusedMoEMethod(AscendMoEScheme):
                 w2_offset=layer.w2_qzeros,
             )
         )
+
+
+@register_scheme("W4A16_GPTQ", "moe")
+class AscendW4A16GPTQFusedMoEMethod(_AscendGPTQFusedMoEMethodBase):
+    """FusedMoE method for Ascend W4A16 GPTQ quantization (4-bit).
+
+    Inherits the full pipeline from ``_AscendGPTQFusedMoEMethodBase``. The
+    4-bit weight repack (``npu_convert_weight_to_int4pack`` along the output
+    dim) is the sole bit-width-specific behavior, isolated in
+    ``_repack_gptq_moe_qweight``.
+    """
+
+    quant_type: QuantType = QuantType.W4A16_GPTQ
+    weight_bits: int = 4
 
 
 @register_scheme("W8A16_GPTQ", "moe")
-class AscendW8A16GPTQFusedMoEMethod(AscendMoEScheme):
+class AscendW8A16GPTQFusedMoEMethod(_AscendGPTQFusedMoEMethodBase):
     """FusedMoE method for Ascend W8A16 GPTQ quantization (8-bit).
 
-    8-bit GPTQ uses int8 weights directly without additional repacking.
+    Inherits the full pipeline from ``_AscendGPTQFusedMoEMethodBase``. The
+    8-bit weight repack (view 4 consecutive int8 as one int32) is the sole
+    bit-width-specific behavior, isolated in ``_repack_gptq_moe_qweight``.
     """
 
     quant_type: QuantType = QuantType.W8A16_GPTQ
-    weight_attrs: dict = {"is_transposed": True}
-
-    def __init__(self, quant_config: "GPTQConfig"):
-        self.quant_config = quant_config
-        self.weight_bits = 8
-        self.pack_factor = 32 // self.weight_bits  # 4
-        self.group_size = quant_config.group_size
-        self.desc_act = quant_config.desc_act
-        self.use_v2_format = quant_config.use_v2_format
-        self.dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
-
-    def get_weight(
-        self,
-        num_experts: int,
-        intermediate_size_per_partition: int,
-        hidden_sizes: int,
-        params_dtype: torch.dtype,
-    ) -> dict[str, Any]:
-        if intermediate_size_per_partition % self.pack_factor != 0:
-            raise ValueError(
-                f"Expecting `intermediate_size_per_partition` {intermediate_size_per_partition} "
-                f"can be divided by `pack_factor` {self.pack_factor}"
-            )
-        if hidden_sizes % self.pack_factor != 0:
-            raise ValueError(
-                f"Expecting `hidden_sizes` {hidden_sizes} can be divided by `pack_factor` {self.pack_factor}"
-            )
-
-        param_dict = {}
-        param_dict["w13_qweight"] = torch.empty(
-            num_experts,
-            hidden_sizes // self.pack_factor,
-            2 * intermediate_size_per_partition,
-            dtype=torch.int32,
-        )
-        param_dict["w2_qweight"] = torch.empty(
-            num_experts,
-            intermediate_size_per_partition // self.pack_factor,
-            hidden_sizes,
-            dtype=torch.int32,
-        )
-        return param_dict
-
-    def get_dynamic_quant_param(
-        self,
-        num_experts: int,
-        intermediate_size_per_partition: int,
-        hidden_sizes: int,
-        params_dtype: torch.dtype,
-    ) -> dict[str, Any]:
-        if intermediate_size_per_partition % self.group_size != 0:
-            raise ValueError(
-                f"GPTQ MoE intermediate_size_per_partition "
-                f"({intermediate_size_per_partition}) must be divisible by "
-                f"group_size ({self.group_size})."
-            )
-        if hidden_sizes % self.group_size != 0:
-            raise ValueError(
-                f"GPTQ MoE hidden_sizes ({hidden_sizes}) must be divisible by "
-                f"group_size ({self.group_size})."
-            )
-
-        param_dict = {}
-        num_groups_w13 = hidden_sizes // self.group_size
-        num_groups_w2 = intermediate_size_per_partition // self.group_size
-
-        param_dict["w13_scales"] = torch.empty(
-            num_experts,
-            num_groups_w13,
-            2 * intermediate_size_per_partition,
-            dtype=params_dtype,
-        )
-        param_dict["w2_scales"] = torch.empty(
-            num_experts,
-            num_groups_w2,
-            hidden_sizes,
-            dtype=params_dtype,
-        )
-
-        param_dict["w13_qzeros"] = torch.empty(
-            num_experts,
-            num_groups_w13,
-            2 * intermediate_size_per_partition // self.pack_factor,
-            dtype=torch.int32,
-        )
-        param_dict["w2_qzeros"] = torch.empty(
-            num_experts,
-            num_groups_w2,
-            hidden_sizes // self.pack_factor,
-            dtype=torch.int32,
-        )
-        return param_dict
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Convert 8-bit GPTQ MoE weights to NPU-compatible format."""
-        # desc_act not supported for MoE — see W4A16 MoE for the rationale.
-        if self.desc_act:
-            raise NotImplementedError(
-                "GPTQ MoE with desc_act=True is not yet supported on Ascend "
-                "NPU: per-expert g_idx reordering is not implemented. Please "
-                "use a GPTQ MoE model with desc_act=False."
-            )
-        # Process w13 (gate_up).
-        # Same input-first layout as 4-bit: (E, H//pf, 2*IN) → unpack → (E, H, 2*IN).
-        # 8-bit has no int4pack repack — 4 int8 are packed into one int32 by
-        # viewing the last (output) dim as int32: (E, H, 2*IN) int8 → (E, H, 2*IN//pf) int32.
-        w13_qweight_unpacked = _unpack_qweight_from_int32(
-            layer.w13_qweight.data.flatten(0, 1),
-            self.weight_bits,
-        ).view(layer.w13_qweight.data.shape[0], -1, layer.w13_qweight.data.shape[2])
-        layer.register_parameter(
-            "w13_qweight",
-            torch.nn.Parameter(
-                w13_qweight_unpacked.contiguous().view(torch.int32),
-                requires_grad=False,
-            ),
-        )
-
-        # Process w2 (down_proj): (E, IN//pf, H) → unpack → (E, IN, H) →
-        # view as int32 → (E, IN, H//pf) int32.
-        w2_qweight_unpacked = _unpack_qweight_from_int32(
-            layer.w2_qweight.data.flatten(0, 1),
-            self.weight_bits,
-        ).view(layer.w2_qweight.data.shape[0], -1, layer.w2_qweight.data.shape[2])
-        layer.register_parameter(
-            "w2_qweight",
-            torch.nn.Parameter(
-                w2_qweight_unpacked.contiguous().view(torch.int32),
-                requires_grad=False,
-            ),
-        )
-
-        # Process qzeros → antiquant_offset
-        center_offset = 1 << (self.weight_bits - 1)  # 128 for 8-bit
-
-        w13_qzeros_unpacked = _unpack_qzeros_from_int32(
-            layer.w13_qzeros.data, self.weight_bits, self.use_v2_format
-        )
-        w13_offset = -(w13_qzeros_unpacked.to(torch.float32) - center_offset)
-        layer.register_parameter(
-            "w13_qzeros",
-            torch.nn.Parameter(
-                w13_offset.to(layer.w13_scales.data.dtype).contiguous(),
-                requires_grad=False,
-            ),
-        )
-
-        w2_qzeros_unpacked = _unpack_qzeros_from_int32(
-            layer.w2_qzeros.data, self.weight_bits, self.use_v2_format
-        )
-        w2_offset = -(w2_qzeros_unpacked.to(torch.float32) - center_offset)
-        layer.register_parameter(
-            "w2_qzeros",
-            torch.nn.Parameter(
-                w2_offset.to(layer.w2_scales.data.dtype).contiguous(),
-                requires_grad=False,
-            ),
-        )
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        num_experts: int = -1,
-        expert_map: torch.Tensor | None = None,
-        topk_group: int | None = None,
-        num_expert_group: int | None = None,
-        custom_routing_function: Callable | None = None,
-        scoring_func: str = "softmax",
-        routed_scaling_factor: float = 1.0,
-        e_score_correction_bias: torch.Tensor | None = None,
-        is_prefill: bool = True,
-        enable_force_load_balance: bool = False,
-        log2phy: torch.Tensor | None = None,
-        global_redundant_expert_num: int = 0,
-        pertoken_scale: Any | None = None,
-        activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        mc2_mask: torch.Tensor | None = None,
-        tid2eid: Any | None = None,
-    ) -> torch.Tensor:
-        if activation != "silu":
-            raise ValueError("Only SiLU activation is supported for Ascend GPTQ MoE.")
-
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            routed_scaling_factor=routed_scaling_factor,
-            e_score_correction_bias=e_score_correction_bias,
-            num_experts=num_experts,
-        )
-
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-
-        moe_comm_method = _EXTRA_CTX.moe_comm_method
-        return moe_comm_method.fused_experts(
-            fused_experts_input=build_fused_experts_input(
-                hidden_states=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                w1=layer.w13_qweight,
-                w2=layer.w2_qweight,
-                quant_type=self.quant_type,
-                dynamic_eplb=self.dynamic_eplb,
-                expert_map=expert_map,
-                global_redundant_expert_num=global_redundant_expert_num,
-                mc2_mask=mc2_mask,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                log2phy=log2phy,
-                pertoken_scale=pertoken_scale,
-                activation=activation,
-                w1_scale=layer.w13_scales,
-                w2_scale=layer.w2_scales,
-                w1_offset=layer.w13_qzeros,
-                w2_offset=layer.w2_qzeros,
-            )
-        )
+    weight_bits: int = 8

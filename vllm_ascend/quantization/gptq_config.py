@@ -52,10 +52,6 @@ from vllm.utils.collection_utils import is_list_of
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
-    from vllm.model_executor.layers.vocab_parallel_embedding import (
-        ParallelLMHead,
-        UnquantizedEmbeddingMethod,
-    )
     from vllm.model_executor.models.utils import WeightsMapper
 else:
     PretrainedConfig = None
@@ -141,9 +137,7 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        raise NotImplementedError(
-            "Ascend hardware does not support 'get_min_capability' feature."
-        )
+        raise NotImplementedError("Ascend hardware does not support 'get_min_capability' feature.")
 
     @staticmethod
     def get_config_filenames() -> list[str]:
@@ -154,20 +148,12 @@ class GPTQConfig(QuantizationConfig):
         weight_bits = cls.get_from_keys(config, ["bits"])
         group_size = cls.get_from_keys(config, ["group_size"])
         desc_act = cls.get_from_keys(config, ["desc_act"])
-        checkpoint_format = cls.get_from_keys_or(
-            config, ["checkpoint_format"], default=""
-        )
+        checkpoint_format = cls.get_from_keys_or(config, ["checkpoint_format"], default="")
         dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
         dynamic = {} if dynamic is None else dynamic
-        lm_head_quantized = cls.get_from_keys_or(
-            config, ["lm_head"], default=False
-        )
-        autoround_version = cls.get_from_keys_or(
-            config, ["autoround_version"], default=""
-        )
-        modules_in_block_to_quantize = cls.get_from_keys_or(
-            config, ["modules_in_block_to_quantize"], default=None
-        )
+        lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
+        autoround_version = cls.get_from_keys_or(config, ["autoround_version"], default="")
+        modules_in_block_to_quantize = cls.get_from_keys_or(config, ["modules_in_block_to_quantize"], default=None)
         return cls(
             weight_bits=weight_bits,
             group_size=group_size,
@@ -188,9 +174,7 @@ class GPTQConfig(QuantizationConfig):
         ``get_quant_method`` prefix checks.
         """
         if self.modules_in_block_to_quantize is not None:
-            self.modules_in_block_to_quantize = hf_to_vllm_mapper.apply_list(
-                self.modules_in_block_to_quantize
-            )
+            self.modules_in_block_to_quantize = hf_to_vllm_mapper.apply_list(self.modules_in_block_to_quantize)
 
     def maybe_update_config(
         self,
@@ -216,9 +200,7 @@ class GPTQConfig(QuantizationConfig):
                 # original modules_in_block_to_quantize: list[list[str]]
                 # flatten to list[str]
                 self.modules_in_block_to_quantize = [
-                    item
-                    for sublist in self.modules_in_block_to_quantize
-                    for item in sublist
+                    item for sublist in self.modules_in_block_to_quantize for item in sublist
                 ]
             return
 
@@ -227,8 +209,7 @@ class GPTQConfig(QuantizationConfig):
         quant_layers: set[str] = {
             param_name.rsplit(".", 1)[0]
             for param_name, info in metadata.items()
-            if (dtype := info.get("dtype", None))
-            and _SAFETENSORS_TO_TORCH_DTYPE[dtype] not in unquant_dtypes
+            if (dtype := info.get("dtype", None)) and _SAFETENSORS_TO_TORCH_DTYPE[dtype] not in unquant_dtypes
         }
         self.modules_in_block_to_quantize = list(quant_layers)
 
@@ -243,9 +224,7 @@ class GPTQConfig(QuantizationConfig):
             UnquantizedEmbeddingMethod,
         )
 
-        parallel_lm_head_quantized = (
-            isinstance(layer, ParallelLMHead) and self.lm_head_quantized
-        )
+        parallel_lm_head_quantized = isinstance(layer, ParallelLMHead) and self.lm_head_quantized
 
         if isinstance(layer, LinearBase) or parallel_lm_head_quantized:
             # Only check skip when modules_in_block_to_quantize is populated
@@ -270,15 +249,10 @@ class GPTQConfig(QuantizationConfig):
             elif self.weight_bits == 8:
                 scheme_name = "W8A16_GPTQ"
             else:
-                raise NotImplementedError(
-                    f"GPTQ with {self.weight_bits}-bit weights is not "
-                    f"supported on Ascend NPU."
-                )
+                raise NotImplementedError(f"GPTQ with {self.weight_bits}-bit weights is not supported on Ascend NPU.")
             scheme_cls = get_scheme_class(scheme_name, "linear")
             if scheme_cls is None:
-                raise NotImplementedError(
-                    f"{scheme_name} linear scheme not found for layer {prefix}"
-                )
+                raise NotImplementedError(f"{scheme_name} linear scheme not found for layer {prefix}")
             return AscendLinearMethod(scheme_cls(self))
 
         elif isinstance(layer, FusedMoE):
@@ -295,14 +269,11 @@ class GPTQConfig(QuantizationConfig):
                 scheme_name = "W8A16_GPTQ"
             else:
                 raise NotImplementedError(
-                    f"GPTQ MoE with {self.weight_bits}-bit weights is not "
-                    f"supported on Ascend NPU."
+                    f"GPTQ MoE with {self.weight_bits}-bit weights is not supported on Ascend NPU."
                 )
             scheme_cls = get_scheme_class(scheme_name, "moe")
             if scheme_cls is None:
-                raise NotImplementedError(
-                    f"{scheme_name} moe scheme not found for layer {prefix}"
-                )
+                raise NotImplementedError(f"{scheme_name} moe scheme not found for layer {prefix}")
             return AscendFusedMoEMethod(scheme_cls(self), layer.moe_config)
 
         return None

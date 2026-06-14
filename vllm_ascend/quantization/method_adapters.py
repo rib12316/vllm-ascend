@@ -77,11 +77,7 @@ class AscendLinearMethod(LinearMethodBase):
             set_weight_attrs(param, dims)
 
             # Set packing attributes only for params that are actually packed
-            if (
-                packed_dim is not None
-                and packed_factor is not None
-                and weight_name not in unpacked_params
-            ):
+            if packed_dim is not None and packed_factor is not None and weight_name not in unpacked_params:
                 set_weight_attrs(param, {"packed_dim": packed_dim, "packed_factor": packed_factor})
 
             layer.register_parameter(weight_name, param)
