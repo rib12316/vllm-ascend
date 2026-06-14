@@ -36,3 +36,9 @@ class QuantType(Enum):
     W4A16_AWQ = 7
     W4A16_GPTQ = 8
     W8A16_GPTQ = 9
+    # torchao weight-only quantization (NPU: forward via npu_weight_quant_batchmatmul)
+    W4A16_TORCHAO = 10
+    W8A16_TORCHAO = 11
+    FP8W_TORCHAO = 12
+    # GGUF (llama.cpp k-quant) — dequant-to-dense on load, simple types later mapped
+    GGUF = 13
