@@ -82,8 +82,9 @@ def test_unsupported_block_type_raises():
     block = _q8_0_block(1.0, torch.zeros(32, dtype=torch.int8))
     import pytest
 
-    with pytest.raises(NotImplementedError, match="Q4_K"):
-        dequantize(block, WT.Q4_K, torch.float32)
+    # Q5_K is not yet implemented (only Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/Q4_K are).
+    with pytest.raises(NotImplementedError, match="Q5_K"):
+        dequantize(block, WT.Q5_K, torch.float32)
 
 
 def test_multi_block_row():
@@ -96,6 +97,71 @@ def test_multi_block_row():
     out = dequantize(row.unsqueeze(0), WT.Q8_0, torch.float32)
     expected = torch.cat([torch.full((32,), 2.0), torch.full((32,), 3.0)])
     torch.testing.assert_close(out[0], expected)
+
+
+def test_q5_0_dequant():
+    # d=2, qh=0, qs low=3 high=5 -> (3-16)*2=-26 ; (5-16)*2=-22
+    d = torch.tensor([2.0], dtype=torch.float16)
+    qs = torch.full((16,), (5 << 4) | 3, dtype=torch.uint8)
+    out = dequantize(
+        torch.cat([d.view(torch.uint8), torch.zeros(4, dtype=torch.uint8), qs]).unsqueeze(0),
+        WT.Q5_0,
+        torch.float32,
+    )
+    expected = torch.cat([torch.full((16,), -26.0), torch.full((16,), -22.0)])
+    torch.testing.assert_close(out[0], expected)
+
+
+def test_q5_0_5th_bit():
+    # qh bit0=1 -> low[0] 5-bit value = 3|16 = 19 -> (19-16)*2 = 6
+    d = torch.tensor([2.0], dtype=torch.float16)
+    qs = torch.full((16,), (5 << 4) | 3, dtype=torch.uint8)
+    qw = torch.cat([d.view(torch.uint8), torch.tensor([1, 0, 0, 0], dtype=torch.uint8), qs]).unsqueeze(0)
+    out = dequantize(qw, WT.Q5_0, torch.float32)
+    assert out[0, 0].item() == 6.0
+    assert out[0, 1].item() == -26.0
+
+
+def test_q5_1_dequant():
+    # d=1, m=0.5, qs low=3 high=5 -> 3.5 ; 5.5
+    dm = torch.tensor([1.0, 0.5], dtype=torch.float16)
+    qs = torch.full((16,), (5 << 4) | 3, dtype=torch.uint8)
+    out = dequantize(
+        torch.cat([dm.view(torch.uint8), torch.zeros(4, dtype=torch.uint8), qs]).unsqueeze(0),
+        WT.Q5_1,
+        torch.float32,
+    )
+    expected = torch.cat([torch.full((16,), 3.5), torch.full((16,), 5.5)])
+    torch.testing.assert_close(out[0], expected)
+
+
+def test_q4_k_dequant_sections():
+    # Degenerate: all 6-bit scales=1, mins=0; dall=2, dmin=0; qs byte=0x13 (low=3, high=1).
+    # Each low section = dall*1*3 = 6, each high section = dall*1*1 = 2.
+    dm = torch.tensor([2.0, 0.0], dtype=torch.float16)
+    scales = torch.tensor([1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.uint8)
+    qs = torch.full((128,), (1 << 4) | 3, dtype=torch.uint8)
+    out = dequantize(
+        torch.cat([dm.view(torch.uint8), scales, qs]).unsqueeze(0),
+        WT.Q4_K,
+        torch.float32,
+    )
+    section_heads = [round(out[0, 32 * s].item()) for s in range(8)]
+    assert section_heads == [6, 2, 6, 2, 6, 2, 6, 2]
+
+
+def test_q4_k_scale_unpacking():
+    # sc[0]=2 (q[0]=2) -> section 0 (low, il0) = dall*sc0*nib = 2*2*3 = 12.
+    dm = torch.tensor([2.0, 0.0], dtype=torch.float16)
+    scales = torch.tensor([2, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.uint8)
+    qs = torch.full((128,), (1 << 4) | 3, dtype=torch.uint8)
+    out = dequantize(
+        torch.cat([dm.view(torch.uint8), scales, qs]).unsqueeze(0),
+        WT.Q4_K,
+        torch.float32,
+    )
+    assert out[0, 0].item() == 12.0  # section 0: dall * sc0 * nib = 2 * 2 * 3
+    assert out[0, 32].item() == 2.0  # section 1 (high, il0): sc1=1 -> 2 * 1 * 1
 
 
 if __name__ == "__main__":
