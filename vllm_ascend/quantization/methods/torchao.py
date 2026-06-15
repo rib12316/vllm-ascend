@@ -252,8 +252,13 @@ def _dequantize_fp8_weight(weight_nk: torch.Tensor, out_dtype: torch.dtype) -> t
     import torch.nn as nn
     from torchao.quantization import Float8WeightOnlyConfig, quantize_
 
-    dummy = nn.Sequential(nn.Linear(weight_nk.shape[1], weight_nk.shape[0], bias=False))
-    dummy[0].weight = torch.nn.Parameter(weight_nk.detach().clone())
+    # fp8 quantize/dequant runs on CPU: on NPU the fp8 path hits CANN error
+    # 561103 (missing prebuilt kernel). The fp8 round-trip is device-independent,
+    # so doing it on CPU is numerically identical; the caller moves the dense
+    # result back to the NPU device.
+    w_cpu = weight_nk.detach().cpu()
+    dummy = nn.Sequential(nn.Linear(w_cpu.shape[1], w_cpu.shape[0], bias=False))
+    dummy[0].weight = torch.nn.Parameter(w_cpu.clone())
     quantize_(dummy, Float8WeightOnlyConfig())
     # Float8Tensor.dequantize() → dense (Float8Tensor has no tensor_impl.get_plain()).
     return dummy[0].weight.dequantize().to(out_dtype)
@@ -281,8 +286,10 @@ class AscendFP8WTorchAOLinearScheme(AscendLinearScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         out_dtype = layer.weight.dtype
+        device = layer.weight.device
         deq = _dequantize_fp8_weight(layer.weight.data, out_dtype)
-        layer.weight = torch.nn.Parameter(deq.contiguous(), requires_grad=False)
+        # fp8 quant/dequant ran on CPU; move the dense result to the NPU device.
+        layer.weight = torch.nn.Parameter(deq.to(device).contiguous(), requires_grad=False)
 
     def apply(
         self,

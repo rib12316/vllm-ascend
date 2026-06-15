@@ -164,6 +164,40 @@ def test_q4_k_scale_unpacking():
     assert out[0, 32].item() == 2.0  # section 1 (high, il0): sc1=1 -> 2 * 1 * 1
 
 
+def test_q6_k_dequant():
+    # block_q6_K = {ql[128]; qh[64]; int8 scales[16]; fp16 d}. Degenerate:
+    # ql=5 (low nibble 5, high 0), qh=0, scales=1, d=1 → sub 0,1 (low nibble)
+    # → (5-32)=-27; sub 2,3 (high nibble) → (0-32)=-32.
+    ql = torch.full((128,), 5, dtype=torch.uint8)
+    qh = torch.zeros(64, dtype=torch.uint8)
+    scales = torch.full((16,), 1, dtype=torch.int8).view(torch.uint8)
+    d = torch.tensor([1.0], dtype=torch.float16)
+    out = dequantize(
+        torch.cat([ql, qh, scales, d.view(torch.uint8)]).unsqueeze(0),
+        WT.Q6_K,
+        torch.float32,
+    )
+    # sub = (p%128)//32: sub0,1 when p%128<64 → -27; sub2,3 → -32
+    expected = torch.tensor([-27.0 if (p % 128) < 64 else -32.0 for p in range(256)])
+    torch.testing.assert_close(out[0], expected)
+
+
+def test_q6_k_scale_per_group():
+    # scales[0]=2 → group 0 (output 0..15) = d*scales[0]*(5-32) = 2*-27 = -54
+    ql = torch.full((128,), 5, dtype=torch.uint8)
+    qh = torch.zeros(64, dtype=torch.uint8)
+    scales = torch.full((16,), 1, dtype=torch.int8).view(torch.uint8)
+    scales[0] = 2
+    d = torch.tensor([1.0], dtype=torch.float16)
+    out = dequantize(
+        torch.cat([ql, qh, scales, d.view(torch.uint8)]).unsqueeze(0),
+        WT.Q6_K,
+        torch.float32,
+    )
+    assert out[0, 0].item() == -54.0  # group 0: scales[0]=2
+    assert out[0, 16].item() == -27.0  # group 1: scales[1]=1
+
+
 if __name__ == "__main__":
     import pytest
 

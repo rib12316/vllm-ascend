@@ -124,13 +124,16 @@ class AscendGGUFLinearMethod(LinearMethodBase):
                 idx = qweight.shard_id_map[sid]
                 qw_bytes = data_container[idx]
                 qtype = qweight_type.shard_weight_type.get(sid, qweight_type.weight_type)
-                shards.append(dequantize(qw_bytes.to(device), qtype, dtype))
+                # Dequant on CPU: the gguf bitwise dequant is bit-exact-validated
+                # on CPU; NPU bitwise ops (>>,&) have broadcasting quirks. The
+                # dense result is moved to the NPU device below.
+                shards.append(dequantize(qw_bytes.cpu(), qtype, dtype))
             # All shards share the input dim K (common case); concat along N.
             dense = torch.cat(shards, dim=0)
         else:
-            # Single (non-fused) materialized quantized weight.
+            # Single (non-fused) materialized quantized weight (dequant on CPU).
             qtype = qweight_type.weight_type
-            dense = dequantize(qweight, qtype, dtype)
+            dense = dequantize(qweight.cpu(), qtype, dtype)
 
         layer.weight = Parameter(dense.to(device).contiguous(), requires_grad=False)
         # Release the quantized intermediates.

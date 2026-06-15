@@ -33,7 +33,7 @@ from gguf import GGML_QUANT_SIZES
 from gguf import GGMLQuantizationType as WT
 
 # Quantization types dequantized to dense by this module.
-GGUF_DEQUANT_TYPES = {WT.Q8_0, WT.Q4_0, WT.Q4_1, WT.Q5_0, WT.Q5_1, WT.Q4_K}
+GGUF_DEQUANT_TYPES = {WT.Q8_0, WT.Q4_0, WT.Q4_1, WT.Q5_0, WT.Q5_1, WT.Q4_K, WT.Q6_K}
 # Unquantized GGUF dtypes stored verbatim in the qweight bytes.
 GGUF_UNQUANTIZED_TYPES = {WT.F16, WT.BF16, WT.F32}
 
@@ -184,6 +184,44 @@ def _q4_k(qweight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(n_rows, n_blocks * block_size).to(dtype)
 
 
+def _q6_k(qweight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    r"""block_q6_K super-block {uint8 ql[128]; uint8 qh[64]; int8 scales[16]; half d} → 256 values.
+
+    6-bit value = (ql nibble) | (qh 2-bit << 4). Ported from
+    ``dequantize.cuh::dequantize_block_q6_K`` via per-output-position index
+    patterns: output p → ip=p//128, sub=(p%128)//32, il=p%32, with
+    ``y = d * scales[8*ip + 2*sub + il//16] * (quant - 32)``.
+    """
+    block_size, type_size = _block_layout(WT.Q6_K)  # 256, 210
+    n_rows, n_bytes = qweight.shape
+    n_blocks = n_bytes // type_size
+    b = qweight.reshape(n_rows, n_blocks, type_size)
+    ql = b[..., 0:128].to(torch.int64)  # [r, nb, 128]
+    qh = b[..., 128:192].to(torch.int64)  # [r, nb, 64]
+    sc = b[..., 192:208].contiguous().view(torch.int8).to(torch.float32)  # [r, nb, 16]
+    d = b[..., 208:210].contiguous().view(torch.float16).to(torch.float32)  # [r, nb, 1]
+
+    # Per-output-position index patterns (block_size=256), computed once.
+    p = torch.arange(block_size)
+    ip = p // 128
+    local = p % 128
+    sub = local // 32  # 0..3 (offset 0,32,64,96)
+    il = local % 32
+    ql_idx = 64 * ip + il + 32 * (sub % 2)  # sub 0,2 → +0; sub 1,3 → +32
+    qh_idx = 32 * ip + il
+    scale_idx = 8 * ip + 2 * sub + (il // 16)
+    qh_shift = 2 * sub
+    low = sub < 2  # sub 0,1 → low nibble; sub 2,3 → high nibble
+
+    ql_g = ql[..., ql_idx]  # [r, nb, 256]
+    ql_nib = torch.where(low, ql_g & 0xF, ql_g >> 4)
+    qh_g = qh[..., qh_idx]
+    quant = ql_nib | (((qh_g >> qh_shift) & 3) << 4)  # 6-bit [r, nb, 256]
+    scale = sc[..., scale_idx]  # [r, nb, 256]
+    y = d * scale * (quant.to(torch.float32) - 32.0)
+    return y.reshape(n_rows, n_blocks * block_size).to(dtype)
+
+
 _DEQUANT_KERNELS = {
     WT.Q8_0: _q8_0,
     WT.Q4_0: _q4_0,
@@ -191,6 +229,7 @@ _DEQUANT_KERNELS = {
     WT.Q5_0: _q5_0,
     WT.Q5_1: _q5_1,
     WT.Q4_K: _q4_k,
+    WT.Q6_K: _q6_k,
 }
 
 
