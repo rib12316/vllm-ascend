@@ -234,3 +234,58 @@ class AscendW4A16TorchAOLinearScheme(AscendLinearScheme):
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
         return _apply_torchao_linear(layer, x, bias, layer.torchao_group_size)
+
+
+def _dequantize_fp8_weight(weight_nk: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Quantize a dense ``[N, K]`` weight with torchao ``Float8WeightOnlyConfig``
+    and dequantize back to dense at load time.
+
+    The fp8 (e4m3) round-trip yields fp8-quality weights; compute then runs as a
+    standard dense linear. This is the CPU-verifiable fallback used until an NPU
+    fp8 matmul op is verified and wired (T-S0 spike) — it carries real torchao fp8
+    quantization precision while running dense.
+    """
+    import torch.nn as nn
+    from torchao.quantization import Float8WeightOnlyConfig, quantize_
+
+    dummy = nn.Sequential(nn.Linear(weight_nk.shape[1], weight_nk.shape[0], bias=False))
+    dummy[0].weight = torch.nn.Parameter(weight_nk.detach().clone())
+    quantize_(dummy, Float8WeightOnlyConfig())
+    # Float8Tensor.dequantize() → dense (Float8Tensor has no tensor_impl.get_plain()).
+    return dummy[0].weight.dequantize().to(out_dtype)
+
+
+@register_scheme("FP8W_TORCHAO", "linear")
+class AscendFP8WTorchAOLinearScheme(AscendLinearScheme):
+    """Linear scheme for torchao fp8wo (Float8 weight-only), dense-compute fallback.
+
+    torchao ``Float8WeightOnlyConfig`` quantizes the dense weight to fp8 (e4m3)
+    on CPU at load time (unlike int4, this needs no ``mslk``); the weight is then
+    dequantized to dense fp16/bf16 and computed via a standard dense linear. The
+    weights thus carry real torchao fp8 quantization precision, while compute
+    runs dense until an NPU fp8 matmul op is verified and wired (T-S0 spike).
+    """
+
+    def __init__(self, quant_config: "TorchAOConfig"):
+        self.is_checkpoint_torchao_serialized = quant_config.is_checkpoint_torchao_serialized
+
+    def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
+        return {
+            "weight": torch.empty(output_size, input_size, dtype=params_dtype),
+            "_param_dims": {"weight": {"input_dim": 1, "output_dim": 0}},
+        }
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        out_dtype = layer.weight.dtype
+        deq = _dequantize_fp8_weight(layer.weight.data, out_dtype)
+        layer.weight = torch.nn.Parameter(deq.contiguous(), requires_grad=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        tp_rank: int | None = 0,
+    ) -> torch.Tensor:
+        # Dense path: layer.weight holds the fp8-dequantized dense weight.
+        return torch.nn.functional.linear(x, layer.weight, bias)
