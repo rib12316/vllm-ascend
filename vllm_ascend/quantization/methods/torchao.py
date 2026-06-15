@@ -86,8 +86,9 @@ def _quantize_dense_int8_per_channel(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a dense ``[N, K]`` weight with torchao ``Int8WeightOnlyConfig``.
 
-    Returns ``(qweight[K, N] int8, scales[1, N])``. torchao int8wo is
-    per-output-channel symmetric: ``dequant = data * scale`` (zero-point 0).
+    Returns ``(qweight[K, N] int8, scales[N])``. torchao int8wo is per-output-channel
+    symmetric: ``dequant = data * scale`` (zero-point 0). The NPU op uses
+    ``antiquant_group_size=0`` for per-channel (group_size==K is unsupported).
     """
     # Imported lazily: torchao is a load-time-only dependency.
     import torch.nn as nn
@@ -100,7 +101,7 @@ def _quantize_dense_int8_per_channel(
     data, scale, _zp = dummy[0].weight.tensor_impl.get_plain()
     # data: [N, K] int8 (centered, range -128..127); scale: [N] fp32 (symmetric).
     qweight = data.to(torch.int8).t().contiguous()  # [K, N] for the NPU op
-    scales = scale.to(out_dtype).unsqueeze(0).contiguous()  # [1, N]
+    scales = scale.to(out_dtype).contiguous()  # [N] (per-output-channel)
     return qweight, scales
 
 
@@ -172,18 +173,21 @@ class AscendW8A16TorchAOLinearScheme(AscendLinearScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         out_dtype = layer.weight.dtype
-        input_size = layer.weight.shape[1]
         output_size = layer.weight.shape[0]
+        device = layer.weight.device
 
         qweight, scales = _quantize_dense_int8_per_channel(layer.weight.data, out_dtype)
         layer.qweight = torch.nn.Parameter(qweight, requires_grad=False)
         layer.scales = torch.nn.Parameter(scales, requires_grad=False)
-        # Symmetric: dequant = data * scale ⟹ antiquant_offset = 0.
-        layer.torchao_offset = torch.nn.Parameter(torch.zeros(1, output_size, dtype=out_dtype), requires_grad=False)
+        # Symmetric: dequant = data * scale ⟹ antiquant_offset = 0 (kept on-device).
+        layer.torchao_offset = torch.nn.Parameter(
+            torch.zeros(output_size, dtype=out_dtype, device=device), requires_grad=False
+        )
         layer.torchao_output_size = output_size
-        layer.torchao_group_size = input_size  # per-channel: one group spans K
+        # per-channel via group_size=0 (the NPU op rejects group_size == K).
+        layer.torchao_group_size = 0
         # Free the dense weight (the whole point of quantization).
-        layer.weight = torch.nn.Parameter(torch.empty(0, dtype=out_dtype), requires_grad=False)
+        layer.weight = torch.nn.Parameter(torch.empty(0, dtype=out_dtype, device=device), requires_grad=False)
 
     def apply(
         self,

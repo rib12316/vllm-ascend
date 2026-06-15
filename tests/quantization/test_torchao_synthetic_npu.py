@@ -21,12 +21,14 @@ Builds a fake layer from the scheme's weight-processing output and compares
 a pure-torch reference reconstructed from the quantized params:
 
 - int8wo: reference = x @ (qweight * scales); the quantization itself is verified
-  to *exactly* match torchao ``Int8WeightOnlyConfig`` on CPU (see tests in the
-  code-review of methods/torchao.py), so this validates the NPU forward path.
+  to *exactly* match torchao ``Int8WeightOnlyConfig`` (see tests in the
+  code-review of methods/torchao.py), so this validates the NPU forward path
+  (per-channel, antiquant_group_size=K).
 - int4wo: reference = x @ (q_flat * group-expanded scales); validates the
-  self-implemented per-group symmetric int4 path end-to-end on the NPU op.
+  self-implemented per-group symmetric int4 path end-to-end on the NPU op
+  (int4pack + npu_weight_quant_batchmatmul, group_size=128).
 
-Requires Ascend NPU hardware; skipped otherwise.
+Requires Ascend NPU hardware; skipped otherwise. All tensors live on NPU.
 
 Usage:
     pytest tests/quantization/test_torchao_synthetic_npu.py -v
@@ -47,17 +49,20 @@ pytestmark = pytest.mark.skipif(not _npu_available(), reason="Ascend NPU not ava
 
 
 def _make_layer(scheme, weight_nk, dtype):
-    """Build a fake layer with a dense ``weight`` and run process_weights."""
+    """Build a fake layer with a dense ``weight`` (on NPU) and run process_weights.
+
+    The weight is placed on NPU up front so int8 (torchao quantize_) and int4
+    (npu_convert_weight_to_int4pack) both run on NPU, leaving qweight/scales on
+    NPU ready for the apply() NPU op.
+    """
     layer = torch.nn.Module()
-    layer.weight = torch.nn.Parameter(weight_nk.to(dtype), requires_grad=False)
+    layer.weight = torch.nn.Parameter(weight_nk.to(dtype).npu(), requires_grad=False)
     scheme.process_weights_after_loading(layer)
     return layer
 
 
 def test_int8_synthetic_matches_reference():
-    from vllm_ascend.quantization.methods.torchao import (
-        AscendW8A16TorchAOLinearScheme,
-    )
+    from vllm_ascend.quantization.methods.torchao import AscendW8A16TorchAOLinearScheme
     from vllm_ascend.quantization.torchao_config import TorchAOConfig
 
     torch.manual_seed(0)
@@ -84,7 +89,7 @@ def test_int4_synthetic_matches_reference():
 
     torch.manual_seed(0)
     group_size = 128
-    N, K = 64, group_size  # K == group_size ⇒ one group per output channel
+    N, K = 64, 256  # K must exceed group_size (NPU op requires group_size < K)
     dtype = torch.float16
     W = torch.randn(N, K, dtype=dtype) * 0.1
 
@@ -92,10 +97,10 @@ def test_int4_synthetic_matches_reference():
     scheme = AscendW4A16TorchAOLinearScheme(cfg)
     layer = _make_layer(scheme, W, dtype)
 
-    # Reference reconstructed from the (unpacked) math, not the int4-packed tensor.
+    # Reference reconstructed from the (unpacked) math, on NPU.
     q_flat, scales = _int4_symmetric_quant(W, group_size)  # [K,N], [G,N]
-    scales_expanded = scales.float().repeat_interleave(group_size, dim=0)  # [K,N]
-    ref_weight = q_flat.float() * scales_expanded
+    scales_expanded = scales.float().repeat_interleave(group_size, dim=0).npu()  # [K,N]
+    ref_weight = q_flat.float().npu() * scales_expanded
 
     x = (torch.randn(8, K, dtype=dtype) * 0.1).npu()
     out = scheme.apply(layer, x)
