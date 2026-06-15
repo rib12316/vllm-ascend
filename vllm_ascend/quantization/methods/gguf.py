@@ -114,7 +114,13 @@ class AscendGGUFLinearMethod(LinearMethodBase):
         if data_container:
             # Fused / multi-shard layer (e.g. gate_up_proj, qkv_proj): the
             # loader placed each shard's raw quantized bytes in data_container.
-            for sid in qweight.shard_id:
+            # QKVParallelLinear splits its output by position [q, k, v], but the
+            # loader's shard_id can arrive as ['k','q','v'] — normalize to the
+            # partition order (mirrors upstream GGUFLinearMethod.apply).
+            shard_ids = qweight.shard_id
+            if "q" in shard_ids:
+                shard_ids = ["q", "k", "v"]
+            for sid in shard_ids:
                 idx = qweight.shard_id_map[sid]
                 qw_bytes = data_container[idx]
                 qtype = qweight_type.shard_weight_type.get(sid, qweight_type.weight_type)
