@@ -48,15 +48,13 @@ def default_vllm_config():
     with set_current_vllm_config(mock_config):
         yield mock_config
 
+
 # TinyLlama GPTQ snapshot (already on disk) — used for the real-model
 # maybe_update_config (T16) test. Resolved lazily so collection does not fail
 # if the cache is absent.
 import glob
 
-_TINYLLAMA_SNAPSHOTS = (
-    "/data/huggingface_home/hub/"
-    "models--TheBloke--TinyLlama-1.1B-Chat-v1.0-GPTQ/snapshots/*/"
-)
+_TINYLLAMA_SNAPSHOTS = "/data/huggingface_home/hub/models--TheBloke--TinyLlama-1.1B-Chat-v1.0-GPTQ/snapshots/*/"
 
 
 def _tinyllama_path():
@@ -153,8 +151,7 @@ class TestGroupSizeValidation:
         cfg = AWQConfig(weight_bits=4, group_size=128, zero_point=True)
         scheme = AscendW4A16AWQLinearScheme(cfg)
         with pytest.raises(ValueError, match="divisible"):
-            scheme.get_weight(input_size=100, output_size=256,
-                              params_dtype=torch.float16)
+            scheme.get_weight(input_size=100, output_size=256, params_dtype=torch.float16)
 
     def test_awq_linear_alignment_get_pergroup_param(self):
         from vllm_ascend.quantization.awq_config import AWQConfig
@@ -165,8 +162,7 @@ class TestGroupSizeValidation:
         cfg = AWQConfig(weight_bits=4, group_size=128, zero_point=True)
         scheme = AscendW4A16AWQLinearScheme(cfg)
         with pytest.raises(ValueError, match="divisible"):
-            scheme.get_pergroup_param(input_size=100, output_size=256,
-                                      params_dtype=torch.float16)
+            scheme.get_pergroup_param(input_size=100, output_size=256, params_dtype=torch.float16)
 
     def test_gptq_linear_alignment(self):
         from vllm_ascend.quantization.gptq_config import GPTQConfig
@@ -177,8 +173,7 @@ class TestGroupSizeValidation:
         cfg = GPTQConfig(weight_bits=4, group_size=128, desc_act=False)
         scheme = AscendW4A16GPTQLinearScheme(cfg)
         with pytest.raises(ValueError, match="divisible"):
-            scheme.get_pergroup_param(input_size=100, output_size=256,
-                                      params_dtype=torch.float16)
+            scheme.get_pergroup_param(input_size=100, output_size=256, params_dtype=torch.float16)
 
     def test_awq_linear_alignment_accepts_valid(self):
         from vllm_ascend.quantization.awq_config import AWQConfig
@@ -188,8 +183,7 @@ class TestGroupSizeValidation:
 
         cfg = AWQConfig(weight_bits=4, group_size=128, zero_point=True)
         scheme = AscendW4A16AWQLinearScheme(cfg)
-        spec = scheme.get_weight(input_size=256, output_size=256,
-                                 params_dtype=torch.float16)
+        spec = scheme.get_weight(input_size=256, output_size=256, params_dtype=torch.float16)
         # qweight shape: (input_size, output_size // pack_factor)
         assert spec["qweight"].shape == (256, 256 // 8)
 
@@ -208,8 +202,7 @@ class TestLMHeadRouting:
     def _make_config(self, lm_head_quantized):
         from vllm_ascend.quantization.gptq_config import GPTQConfig
 
-        cfg = GPTQConfig(weight_bits=4, group_size=128, desc_act=False,
-                         lm_head_quantized=lm_head_quantized)
+        cfg = GPTQConfig(weight_bits=4, group_size=128, desc_act=False, lm_head_quantized=lm_head_quantized)
         # packed_modules_mapping is normally populated by the model loader;
         # set an empty mapping so get_quant_method works standalone.
         cfg.packed_modules_mapping = {}
@@ -226,8 +219,8 @@ class TestLMHeadRouting:
         lm_head = MagicMock(spec=ParallelLMHead)
         method = cfg.get_quant_method(lm_head, prefix="lm_head")
         assert isinstance(method, AscendLinearMethod), (
-            "lm_head_quantized=True must route ParallelLMHead to the "
-            "quantization path, got %r" % type(method))
+            "lm_head_quantized=True must route ParallelLMHead to the quantization path, got %r" % type(method)
+        )
 
     def test_lm_head_not_quantized_returns_none(self):
         from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -238,8 +231,8 @@ class TestLMHeadRouting:
         lm_head = MagicMock(spec=ParallelLMHead)
         method = cfg.get_quant_method(lm_head, prefix="lm_head")
         assert method is None, (
-            "lm_head_quantized=False must leave ParallelLMHead unquantized "
-            "(return None), got %r" % type(method))
+            "lm_head_quantized=False must leave ParallelLMHead unquantized (return None), got %r" % type(method)
+        )
 
     def test_lm_head_skipped_when_not_in_block_list(self):
         # When modules_in_block_to_quantize is populated but lm_head is NOT
@@ -249,10 +242,8 @@ class TestLMHeadRouting:
             ParallelLMHead,
         )
 
-
         cfg = self._make_config(lm_head_quantized=True)
-        cfg.modules_in_block_to_quantize = [
-            "model.layers.0.self_attn.q_proj"]
+        cfg.modules_in_block_to_quantize = ["model.layers.0.self_attn.q_proj"]
         lm_head = MagicMock(spec=ParallelLMHead)
         method = cfg.get_quant_method(lm_head, prefix="lm_head")
         # lm_head not in the quant list but lm_head_quantized=True -> still
@@ -292,20 +283,16 @@ class TestGPTQSkipLogic:
         from vllm_ascend.quantization.method_adapters import AscendLinearMethod
 
         cfg = self._make_config()
-        cfg.modules_in_block_to_quantize = [
-            "model.layers.0.self_attn.q_proj"]
-        method = cfg.get_quant_method(
-            self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
+        cfg.modules_in_block_to_quantize = ["model.layers.0.self_attn.q_proj"]
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
         assert isinstance(method, AscendLinearMethod)
 
     def test_layer_not_in_quant_list_is_unquantized(self):
         from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 
         cfg = self._make_config()
-        cfg.modules_in_block_to_quantize = [
-            "model.layers.0.self_attn.q_proj"]
-        method = cfg.get_quant_method(
-            self._linear_layer(), prefix="model.layers.0.mlp.gate_proj")
+        cfg.modules_in_block_to_quantize = ["model.layers.0.self_attn.q_proj"]
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.mlp.gate_proj")
         assert isinstance(method, AscendUnquantizedLinearMethod)
 
     def test_empty_quant_list_quantizes_all(self):
@@ -315,8 +302,7 @@ class TestGPTQSkipLogic:
 
         cfg = self._make_config()
         # leave modules_in_block_to_quantize empty
-        method = cfg.get_quant_method(
-            self._linear_layer(), prefix="model.layers.0.mlp.down_proj")
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.mlp.down_proj")
         assert isinstance(method, AscendLinearMethod)
 
 
@@ -338,14 +324,11 @@ class TestApplyVLLMMapper:
         cfg.modules_in_block_to_quantize = ["model.layers.0.self_attn.q_proj"]
 
         mapper = MagicMock()
-        mapper.apply_list.return_value = [
-            "model.layers.0.self_attn.qkv_proj"]
+        mapper.apply_list.return_value = ["model.layers.0.self_attn.qkv_proj"]
         cfg.apply_vllm_mapper(mapper)
 
-        mapper.apply_list.assert_called_once_with(
-            ["model.layers.0.self_attn.q_proj"])
-        assert cfg.modules_in_block_to_quantize == [
-            "model.layers.0.self_attn.qkv_proj"]
+        mapper.apply_list.assert_called_once_with(["model.layers.0.self_attn.q_proj"])
+        assert cfg.modules_in_block_to_quantize == ["model.layers.0.self_attn.qkv_proj"]
 
     def test_awq_mapper_translates_skip_list(self):
         from vllm_ascend.quantization.awq_config import AWQConfig
@@ -447,8 +430,7 @@ class TestMaybeUpdateConfig:
             ["layer1.q_proj"],
         ]
         cfg.maybe_update_config("dummy-model")
-        assert cfg.modules_in_block_to_quantize == [
-            "layer0.q_proj", "layer0.k_proj", "layer1.q_proj"]
+        assert cfg.modules_in_block_to_quantize == ["layer0.q_proj", "layer0.k_proj", "layer1.q_proj"]
 
     def test_awq_auto_detect_with_mocked_metadata(self, monkeypatch):
         from vllm_ascend.quantization.awq_config import AWQConfig
@@ -515,10 +497,18 @@ class TestTorchAORouting:
     def test_from_config_int8wo(self):
         from vllm_ascend.quantization.torchao_config import TorchAOConfig
 
-        cfg = TorchAOConfig.from_config(
-            {"quant_method": "torchao", "quant_type": {"default": "int8wo"}}
-        )
+        cfg = TorchAOConfig.from_config({"quant_method": "torchao", "quant_type": {"default": "int8wo"}})
         assert cfg.torchao_quant_type == "int8wo"
+        # Online quant of a dense checkpoint → not torchao-serialized.
+        assert cfg.is_checkpoint_torchao_serialized is False
+
+    def test_from_config_prequant_serialized_opt_in(self):
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        # A torchao-serialized (pre-quant) checkpoint must opt in explicitly.
+        cfg = TorchAOConfig.from_config(
+            {"quant_method": "torchao", "quant_type": {"default": "int8wo"}, "is_checkpoint_torchao_serialized": True}
+        )
         assert cfg.is_checkpoint_torchao_serialized is True
 
     def test_from_config_int4wo_with_group_size(self):
@@ -553,12 +543,8 @@ class TestTorchAORouting:
         )
         from vllm_ascend.quantization.torchao_config import TorchAOConfig
 
-        cfg = TorchAOConfig.from_config(
-            {"quant_method": "torchao", "quant_type": {"default": "int8wo"}}
-        )
-        method = cfg.get_quant_method(
-            self._linear_layer(), prefix="model.layers.0.self_attn.q_proj"
-        )
+        cfg = TorchAOConfig.from_config({"quant_method": "torchao", "quant_type": {"default": "int8wo"}})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
         assert isinstance(method, AscendLinearMethod)
         assert isinstance(method.quant_method, AscendW8A16TorchAOLinearScheme)
 
@@ -569,18 +555,14 @@ class TestTorchAORouting:
         from vllm_ascend.quantization.torchao_config import TorchAOConfig
 
         cfg = TorchAOConfig.from_config({"quant_type": {"default": "int4wo"}})
-        method = cfg.get_quant_method(
-            self._linear_layer(), prefix="model.layers.0.mlp.gate_proj"
-        )
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.mlp.gate_proj")
         assert isinstance(method.quant_method, AscendW4A16TorchAOLinearScheme)
 
     def test_skipped_layer_routes_unquantized(self):
         from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
         from vllm_ascend.quantization.torchao_config import TorchAOConfig
 
-        cfg = TorchAOConfig.from_config(
-            {"quant_type": {"default": "int8wo"}, "modules_to_not_convert": ["lm_head"]}
-        )
+        cfg = TorchAOConfig.from_config({"quant_type": {"default": "int8wo"}, "modules_to_not_convert": ["lm_head"]})
         method = cfg.get_quant_method(self._linear_layer(), prefix="lm_head")
         assert isinstance(method, AscendUnquantizedLinearMethod)
 
@@ -623,9 +605,7 @@ class TestGGUFRouting:
         from vllm_ascend.quantization.methods.gguf import AscendGGUFLinearMethod
 
         cfg = GGUFConfig.from_config({})
-        method = cfg.get_quant_method(
-            MagicMock(spec=LinearBase), prefix="model.layers.0.self_attn.o_proj"
-        )
+        method = cfg.get_quant_method(MagicMock(spec=LinearBase), prefix="model.layers.0.self_attn.o_proj")
         assert isinstance(method, AscendGGUFLinearMethod)
 
     def test_non_linear_returns_none(self):

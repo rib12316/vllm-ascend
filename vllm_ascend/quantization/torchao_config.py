@@ -121,8 +121,12 @@ class TorchAOConfig(QuantizationConfig):
         (to detect a torchao-serialized checkpoint) and ``quant_type.default``
         (the torchao quant type, e.g. ``"int8wo"`` / ``"int4wo-g128"``).
         """
-        quant_method = cls.get_from_keys_or(config, ["quant_method"], None)
-        is_checkpoint_torchao_serialized = quant_method is not None and "torchao" in quant_method
+        # Online quantization of a dense checkpoint is the default. A torchao-
+        # serialized (pre-quantized) checkpoint is opt-in via an explicit field:
+        # "torchao" in quant_method is set for online quant too, so it cannot
+        # distinguish the two (and would wrongly trigger vLLM's torchao
+        # safetensors strategy on a dense checkpoint → "No tensors found").
+        is_checkpoint_torchao_serialized = bool(config.get("is_checkpoint_torchao_serialized", False))
 
         hf_config = cls.get_from_keys_or(config, ["quant_type"], None)
         if hf_config is None:
