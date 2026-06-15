@@ -45,7 +45,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 
 from vllm_ascend.utils import GGUF_QUANTIZATION_METHOD
 
-from .methods.gguf import AscendGGUFLinearMethod
+from .methods.gguf import AscendGGUFEmbeddingMethod, AscendGGUFLinearMethod
 
 
 @register_quantization_config(GGUF_QUANTIZATION_METHOD)
@@ -59,6 +59,7 @@ class GGUFConfig(QuantizationConfig):
 
     def __init__(self, unquantized_modules: list[str] | None = None) -> None:
         super().__init__()
+        self.quant_description = {}
         self.unquantized_modules = unquantized_modules or []
 
     def __repr__(self) -> str:
@@ -107,10 +108,12 @@ class GGUFConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return AscendGGUFLinearMethod(self)
         elif isinstance(layer, VocabParallelEmbedding):
-            # MVP: keep embeddings dense (dequant-at-load for embed is G-16).
+            # lm_head / embed_tokens: dequant to dense at load (same as linear),
+            # then a plain embedding lookup. GGUF always pairs qweight with a
+            # qweight_type, so the method must create both params.
             if is_layer_skipped_gguf(prefix, self.unquantized_modules, self.packed_modules_mapping):
                 return UnquantizedEmbeddingMethod()
-            return UnquantizedEmbeddingMethod()
+            return AscendGGUFEmbeddingMethod(self)
         elif isinstance(layer, FusedMoE):
             # MoE dequant-at-load is G-10; not in the MVP.
             raise NotImplementedError(

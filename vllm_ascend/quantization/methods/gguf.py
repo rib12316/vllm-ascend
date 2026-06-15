@@ -107,6 +107,7 @@ class AscendGGUFLinearMethod(LinearMethodBase):
         dtype = self.params_dtype
         qweight = layer.qweight
         qweight_type = layer.qweight_type
+        device = qweight.device  # keep the dequantized weight on the model device
 
         shards = []
         data_container = getattr(qweight, "data_container", None) or []
@@ -117,7 +118,7 @@ class AscendGGUFLinearMethod(LinearMethodBase):
                 idx = qweight.shard_id_map[sid]
                 qw_bytes = data_container[idx]
                 qtype = qweight_type.shard_weight_type.get(sid, qweight_type.weight_type)
-                shards.append(dequantize(qw_bytes, qtype, dtype))
+                shards.append(dequantize(qw_bytes.to(device), qtype, dtype))
             # All shards share the input dim K (common case); concat along N.
             dense = torch.cat(shards, dim=0)
         else:
@@ -125,10 +126,10 @@ class AscendGGUFLinearMethod(LinearMethodBase):
             qtype = qweight_type.weight_type
             dense = dequantize(qweight, qtype, dtype)
 
-        layer.weight = Parameter(dense.contiguous(), requires_grad=False)
+        layer.weight = Parameter(dense.to(device).contiguous(), requires_grad=False)
         # Release the quantized intermediates.
-        layer.qweight = Parameter(torch.empty(0, dtype=dtype), requires_grad=False)
-        layer.qweight_type = Parameter(torch.empty(0, dtype=torch.uint8), requires_grad=False)
+        layer.qweight = Parameter(torch.empty(0, dtype=dtype, device=device), requires_grad=False)
+        layer.qweight_type = Parameter(torch.empty(0, dtype=torch.uint8, device=device), requires_grad=False)
 
     def apply(
         self,
@@ -138,3 +139,17 @@ class AscendGGUFLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         # layer.weight is dense [N, K] (output, input) after process.
         return F.linear(x, layer.weight, bias)
+
+
+class AscendGGUFEmbeddingMethod(AscendGGUFLinearMethod):
+    """GGUF embedding method: dequant to dense at load, plain embedding lookup.
+
+    Inherits create_weights / process_weights_after_loading from
+    AscendGGUFLinearMethod (so qweight/qweight_type are created and dequantized
+    to dense ``layer.weight``). The GGUF VocabParallelEmbedding (e.g. lm_head)
+    calls ``embedding(layer, x)``; since the weight is already dense, this is a
+    plain lookup.
+    """
+
+    def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        return F.embedding(x, layer.weight)
