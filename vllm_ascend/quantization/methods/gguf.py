@@ -35,12 +35,14 @@ has a dedicated ``AscendGGUFLinearMethod`` that:
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 from torch.nn.parameter import Parameter
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization.gguf import GGUFUninitializedParameter
 from vllm.model_executor.utils import set_weight_attrs
 
 from .gguf_dequant import dequantize
+from .gguf_repack import GGUF_NPU_REPACK_TYPES, repack_to_npu
 
 
 class AscendGGUFLinearMethod(LinearMethodBase):
@@ -102,42 +104,57 @@ class AscendGGUFLinearMethod(LinearMethodBase):
         set_weight_attrs(qweight_type, extra_weight_attrs)
         layer.register_parameter("qweight_type", qweight_type)
 
+    # High-perf route: simple block types (Q8_0/Q4_0/Q4_1) are repacked to the
+    # NPU op (weights stay quantized → real memory saving). False forces the
+    # dense-dequant fallback (used by the embedding method, whose lookup/sampler
+    # matmul needs a dense weight).
+    high_perf: bool = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        """Dequantize each GGUF shard to dense and concatenate along the output dim."""
+        """Repack simple types to the NPU op (high-perf) or dequant to dense (k-quants)."""
         dtype = self.params_dtype
         qweight = layer.qweight
         qweight_type = layer.qweight_type
-        device = qweight.device  # keep the dequantized weight on the model device
+        device = qweight.device
 
-        shards = []
+        # Gather (bytes, qtype) per shard on CPU, QKV-reordered.
         data_container = getattr(qweight, "data_container", None) or []
         if data_container:
-            # Fused / multi-shard layer (e.g. gate_up_proj, qkv_proj): the
-            # loader placed each shard's raw quantized bytes in data_container.
-            # QKVParallelLinear splits its output by position [q, k, v], but the
-            # loader's shard_id can arrive as ['k','q','v'] — normalize to the
-            # partition order (mirrors upstream GGUFLinearMethod.apply).
             shard_ids = qweight.shard_id
-            if "q" in shard_ids:
+            if "q" in shard_ids:  # QKV: loader order can be ['k','q','v'] → [q,k,v]
                 shard_ids = ["q", "k", "v"]
-            for sid in shard_ids:
-                idx = qweight.shard_id_map[sid]
-                qw_bytes = data_container[idx]
-                qtype = qweight_type.shard_weight_type.get(sid, qweight_type.weight_type)
-                # Dequant on CPU: the gguf bitwise dequant is bit-exact-validated
-                # on CPU; NPU bitwise ops (>>,&) have broadcasting quirks. The
-                # dense result is moved to the NPU device below.
-                shards.append(dequantize(qw_bytes.cpu(), qtype, dtype))
-            # All shards share the input dim K (common case); concat along N.
-            dense = torch.cat(shards, dim=0)
+            shard_specs = [
+                (
+                    data_container[qweight.shard_id_map[sid]].cpu(),
+                    qweight_type.shard_weight_type.get(sid, qweight_type.weight_type),
+                )
+                for sid in shard_ids
+            ]
         else:
-            # Single (non-fused) materialized quantized weight (dequant on CPU).
-            qtype = qweight_type.weight_type
-            dense = dequantize(qweight.cpu(), qtype, dtype)
+            shard_specs = [(qweight.cpu(), qweight_type.weight_type)]
 
-        layer.weight = Parameter(dense.to(device).contiguous(), requires_grad=False)
-        # Release the quantized intermediates.
-        layer.qweight = Parameter(torch.empty(0, dtype=dtype, device=device), requires_grad=False)
+        if self.high_perf and shard_specs and all(qt in GGUF_NPU_REPACK_TYPES for _, qt in shard_specs):
+            # HIGH-PERF: repack each shard to npu_weight_quant_batchmatmul format
+            # (weights stay quantized → memory saving), concat along output dim.
+            qws, scales, offsets = [], [], []
+            group_size = None
+            for bytes_, qt in shard_specs:
+                qw, sc, off, group_size = repack_to_npu(bytes_.to(device), qt, dtype)
+                qws.append(qw)
+                scales.append(sc)
+                offsets.append(off)
+            layer.qweight = Parameter(torch.cat(qws, dim=1).to(device), requires_grad=False)
+            layer.scales = Parameter(torch.cat(scales, dim=1).to(device), requires_grad=False)
+            layer.offset = Parameter(torch.cat(offsets, dim=1).to(device), requires_grad=False)
+            layer.group_size = group_size
+            layer.output_size = sum(b.shape[0] for b, _ in shard_specs)  # logical total N
+            layer.weight = Parameter(torch.empty(0, dtype=dtype, device=device), requires_grad=False)
+        else:
+            # DENSE fallback (k-quants Q4_K/Q5_K/Q6_K …): dequant on CPU, concat.
+            dense = torch.cat([dequantize(b, qt, dtype) for b, qt in shard_specs], dim=0)
+            layer.weight = Parameter(dense.to(device).contiguous(), requires_grad=False)
+            layer.qweight = Parameter(torch.empty(0, dtype=dtype, device=device), requires_grad=False)
+
         layer.qweight_type = Parameter(torch.empty(0, dtype=torch.uint8, device=device), requires_grad=False)
 
     def apply(
@@ -146,19 +163,32 @@ class AscendGGUFLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # layer.weight is dense [N, K] (output, input) after process.
+        if layer.qweight.numel() > 0:  # high-perf (quantized) path
+            if bias is not None and bias.dtype == torch.bfloat16:
+                bias = bias.float()
+            reshaped_x = x.reshape(-1, x.shape[-1])
+            out = torch_npu.npu_weight_quant_batchmatmul(
+                reshaped_x,
+                layer.qweight,
+                antiquant_scale=layer.scales,
+                antiquant_offset=layer.offset,
+                antiquant_group_size=layer.group_size,
+                bias=bias,
+            )
+            return out.reshape(x.shape[:-1] + (layer.output_size,))
+        # dense fallback (k-quants): layer.weight is dense [N, K].
         return F.linear(x, layer.weight, bias)
 
 
 class AscendGGUFEmbeddingMethod(AscendGGUFLinearMethod):
     """GGUF embedding method: dequant to dense at load, plain embedding lookup.
 
-    Inherits create_weights / process_weights_after_loading from
-    AscendGGUFLinearMethod (so qweight/qweight_type are created and dequantized
-    to dense ``layer.weight``). The GGUF VocabParallelEmbedding (e.g. lm_head)
-    calls ``embedding(layer, x)``; since the weight is already dense, this is a
-    plain lookup.
+    Embeddings (token_embd / lm_head) always use the dense path: the input
+    embedding is a row lookup and the lm_head weight is matmul'd directly by the
+    sampler, both needing a dense weight (so high_perf is forced off here).
     """
+
+    high_perf = False
 
     def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
         return F.embedding(x, layer.weight)
