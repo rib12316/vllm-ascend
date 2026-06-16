@@ -518,6 +518,16 @@ class TestTorchAORouting:
         assert cfg.torchao_quant_type == "int4wo"
         assert cfg.group_size == 64
 
+    def test_from_config_dict_form(self):
+        # The serialized AOBaseConfig dict form (name + group_size) is also accepted.
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig.from_config(
+            {"quant_type": {"default": {"name": "Int8WeightOnlyConfig", "group_size": 128}}}
+        )
+        assert cfg.torchao_quant_type == "int8wo"
+        assert cfg.group_size == 128
+
     def test_unsupported_type_rejected(self):
         from vllm_ascend.quantization.torchao_config import TorchAOConfig
 
