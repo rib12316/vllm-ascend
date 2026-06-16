@@ -82,9 +82,9 @@ def test_unsupported_block_type_raises():
     block = _q8_0_block(1.0, torch.zeros(32, dtype=torch.int8))
     import pytest
 
-    # Q5_K is not yet implemented (only Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/Q4_K are).
-    with pytest.raises(NotImplementedError, match="Q5_K"):
-        dequantize(block, WT.Q5_K, torch.float32)
+    # Q2_K is not yet implemented (k-quants Q4_K/Q5_K/Q6_K are; Q2_K/Q3_K are not).
+    with pytest.raises(NotImplementedError, match="Q2_K"):
+        dequantize(block, WT.Q2_K, torch.float32)
 
 
 def test_multi_block_row():
@@ -196,6 +196,39 @@ def test_q6_k_scale_per_group():
     )
     assert out[0, 0].item() == -54.0  # group 0: scales[0]=2
     assert out[0, 16].item() == -27.0  # group 1: scales[1]=1
+
+
+def test_q5_k_dequant():
+    # block_q5_K = {dm; scales[12]; qh[32]; qs[128]}. Degenerate: scales=1, mn=0,
+    # dall=1, dmin=0, qs byte=0x15 (low=5, high=1), qh=0 → even sections(low)=5,
+    # odd sections(high)=1.
+    dm = torch.tensor([1.0, 0.0], dtype=torch.float16)
+    scales = torch.tensor([1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.uint8)
+    qh = torch.zeros(32, dtype=torch.uint8)
+    qs = torch.full((128,), (1 << 4) | 5, dtype=torch.uint8)
+    out = dequantize(
+        torch.cat([dm.view(torch.uint8), scales, qh, qs]).unsqueeze(0),
+        WT.Q5_K,
+        torch.float32,
+    )
+    heads = [round(out[0, 32 * s].item()) for s in range(8)]
+    assert heads == [5, 1, 5, 1, 5, 1, 5, 1]
+
+
+def test_q5_k_5th_bit():
+    # qh[0]=1 → section 0 reads qh bit 0 → position 0 gets +16 → 5+16=21.
+    dm = torch.tensor([1.0, 0.0], dtype=torch.float16)
+    scales = torch.tensor([1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.uint8)
+    qh = torch.zeros(32, dtype=torch.uint8)
+    qh[0] = 1
+    qs = torch.full((128,), (1 << 4) | 5, dtype=torch.uint8)
+    out = dequantize(
+        torch.cat([dm.view(torch.uint8), scales, qh, qs]).unsqueeze(0),
+        WT.Q5_K,
+        torch.float32,
+    )
+    assert out[0, 0].item() == 21.0  # section 0, pos 0: 5 + 16
+    assert out[0, 1].item() == 5.0  # pos 1: no 5th bit
 
 
 if __name__ == "__main__":

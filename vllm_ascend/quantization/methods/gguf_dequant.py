@@ -33,7 +33,7 @@ from gguf import GGML_QUANT_SIZES
 from gguf import GGMLQuantizationType as WT
 
 # Quantization types dequantized to dense by this module.
-GGUF_DEQUANT_TYPES = {WT.Q8_0, WT.Q4_0, WT.Q4_1, WT.Q5_0, WT.Q5_1, WT.Q4_K, WT.Q6_K}
+GGUF_DEQUANT_TYPES = {WT.Q8_0, WT.Q4_0, WT.Q4_1, WT.Q5_0, WT.Q5_1, WT.Q4_K, WT.Q5_K, WT.Q6_K}
 # Unquantized GGUF dtypes stored verbatim in the qweight bytes.
 GGUF_UNQUANTIZED_TYPES = {WT.F16, WT.BF16, WT.F32}
 
@@ -222,6 +222,38 @@ def _q6_k(qweight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(n_rows, n_blocks * block_size).to(dtype)
 
 
+def _q5_k(qweight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    r"""block_q5_K super-block {half2 dm (dall,dmin); scales[12]; qh[32]; qs[128]} → 256 values.
+
+    Like Q4_K (8 sections of 32, low/high nibbles, per-section 6-bit scale/min via
+    ``get_scale_min_k4``) but each value is 5-bit = nibble + (qh bit << 4). Section
+    ``s`` reads qh bit ``s``. ``y = dall*sc*(nib + bit5*16) - dmin*mn``.
+    Ported from ``dequantize.cuh::dequantize_block_q5_K``.
+    """
+    block_size, type_size = _block_layout(WT.Q5_K)  # 256, 176
+    n_rows, n_bytes = qweight.shape
+    n_blocks = n_bytes // type_size
+    b = qweight.reshape(n_rows, n_blocks, type_size)
+    dm = b[..., :4].contiguous().view(torch.float16).to(torch.float32)  # [r, nb, 2]
+    dall = dm[..., 0:1]  # [r, nb, 1]
+    dmin = dm[..., 1:2]  # [r, nb, 1]
+    scales = b[..., 4:16]  # [r, nb, 12]
+    qh = b[..., 16:48].to(torch.int64)  # [r, nb, 32]
+    qs = b[..., 48:].to(torch.int32)  # [r, nb, 128]
+    sc, mn = _unpack_k4_scales(scales)  # [r, nb, 8] each
+    d_sections = (dall * sc.to(torch.float32))[..., None]  # [r, nb, 8, 1]
+    m_sections = (dmin * mn.to(torch.float32))[..., None]  # [r, nb, 8, 1]
+    qs_groups = qs.reshape(n_rows, n_blocks, 4, 32)  # 4 il-groups of 32 bytes
+    low = qs_groups & 0xF  # [r, nb, 4, 32]
+    high = qs_groups >> 4  # [r, nb, 4, 32]
+    sections = torch.stack([low, high], dim=3).reshape(n_rows, n_blocks, 8, 32)
+    # 5th bit: section s reads qh bit s, at byte position j → [r, nb, 8, 32].
+    bit5 = ((qh.unsqueeze(2) >> torch.arange(8, device=qweight.device).reshape(1, 1, 8, 1)) & 1) << 4
+    sections_5bit = sections.to(torch.int64) + bit5  # 5-bit values 0..31
+    y = d_sections * sections_5bit.to(torch.float32) - m_sections  # [r, nb, 8, 32]
+    return y.reshape(n_rows, n_blocks * block_size).to(dtype)
+
+
 _DEQUANT_KERNELS = {
     WT.Q8_0: _q8_0,
     WT.Q4_0: _q4_0,
@@ -229,6 +261,7 @@ _DEQUANT_KERNELS = {
     WT.Q5_0: _q5_0,
     WT.Q5_1: _q5_1,
     WT.Q4_K: _q4_k,
+    WT.Q5_K: _q5_k,
     WT.Q6_K: _q6_k,
 }
 
