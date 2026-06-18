@@ -33,6 +33,17 @@ AWQ/GPTQ — torchao is never on the hot path.
 int4wo is *self-implemented* (per-group symmetric int4 RTN) because torchao 0.17's
 standard int4 path requires ``mslk`` (a CUDA/H100-only kernel) unavailable on NPU;
 its numerics match torchao int4wo and are validated against ``.dequantize()``.
+
+Why override the native config (same Pattern A as AWQ/GPTQ): torchao is an external
+PyTorch library whose native vLLM path delegates quant+matmul to the torchao
+library's CUDA kernels (tinygemm/mslk). On NPU those kernels are unavailable, and
+the native config is a thin shell with nothing NPU-adjustable inside it — so
+replacing the config is the natural granularity, exactly as for AWQ/GPTQ.
+
+Scope: int8wo/fp8wo/int4wo are *online* quantization of a dense checkpoint. Loading
+a *pre-quantized* torchao int4 checkpoint is **out of MVP scope** (T-10): its packed
+serialization format is not yet handled. int8/fp8 pre-quantized checkpoints are
+tractable via torchao ``unflatten_tensor_state_dict``.
 """
 
 from typing import Any

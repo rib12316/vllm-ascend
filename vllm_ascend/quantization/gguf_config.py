@@ -18,9 +18,15 @@
 """GGUF quantization config for Ascend NPU.
 
 This config overrides vLLM's native ``GGUFConfig`` so ``--quantization gguf``
-loads ``.gguf`` models on Ascend NPU via a dedicated
-``AscendGGUFLinearMethod`` that dequantizes each GGUF block type to dense
-fp16/bf16 at load time (pure-torch kernels — see ``methods/gguf_dequant.py``).
+loads ``.gguf`` models on Ascend NPU via a dedicated ``AscendGGUFLinearMethod``
+that takes one of two paths per block type:
+
+- **High-perf path** (Q8_0/Q4_0/Q4_1): ``methods/gguf_repack.py`` repacks the
+  block into ``npu_weight_quant_batchmatmul``'s per-group(32) int8/int4 format,
+  so weights stay quantized at runtime (memory saving + fused dequant+matmul).
+- **Dense fallback** (K-quants Q4_K/Q5_K/Q6_K and others): pure-torch dequant to
+  dense fp16/bf16 at load time (``methods/gguf_dequant.py``), then ``F.linear``.
+  Correctness-first; the 6-bit super-block scales cannot map to the NPU op.
 
 Unlike AWQ/GPTQ, GGUF uses the ``is_gguf_weight`` / ``is_gguf_weight_type``
 loader contract, so it does NOT route through the ``AscendLinearScheme``
