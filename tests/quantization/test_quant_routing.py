@@ -511,6 +511,21 @@ class TestTorchAORouting:
         )
         assert cfg.is_checkpoint_torchao_serialized is True
 
+    def test_from_config_prequant_flat_flag(self):
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        # T-10: a flat-tensor pre-quantized checkpoint opts in via "prequant":
+        # true (distinct from is_checkpoint_torchao_serialized, which would
+        # trigger vLLM's native torchao AQTensor loader). Default is False.
+        cfg_off = TorchAOConfig.from_config({"quant_method": "torchao", "quant_type": {"default": "int8wo"}})
+        assert cfg_off.is_prequant_checkpoint is False
+        cfg_on = TorchAOConfig.from_config(
+            {"quant_method": "torchao", "quant_type": {"default": "int8wo"}, "prequant": True}
+        )
+        assert cfg_on.is_prequant_checkpoint is True
+        # pre-quant flat path keeps the native torchao loader OFF
+        assert cfg_on.is_checkpoint_torchao_serialized is False
+
     def test_from_config_int4wo_with_group_size(self):
         from vllm_ascend.quantization.torchao_config import TorchAOConfig
 

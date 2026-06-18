@@ -161,9 +161,26 @@ class AscendW8A16TorchAOLinearScheme(AscendLinearScheme):
 
     def __init__(self, quant_config: "TorchAOConfig"):
         self.group_size = quant_config.group_size
-        self.is_checkpoint_torchao_serialized = quant_config.is_checkpoint_torchao_serialized
+        # Flat-tensor pre-quantized checkpoint (T-10): int8 data + scale loaded
+        # directly via the DEFAULT weight loader (NOT torchao's native AQTensor
+        # loader — that is triggered by is_checkpoint_torchao_serialized and
+        # expects a different on-disk format).
+        self.is_prequant_checkpoint = getattr(quant_config, "is_prequant_checkpoint", False)
 
     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
+        if self.is_prequant_checkpoint:
+            # Pre-quantized checkpoint (T-10): the int8 data [K,N] + per-channel
+            # scale [N] are stored as flat tensors (AWQ/GPTQ-style) and loaded
+            # directly — no online re-quantization. Mirrors the online path's
+            # post-quant layout so apply() is identical.
+            return {
+                "qweight": torch.empty(input_size, output_size, dtype=torch.int8),
+                "scales": torch.empty(output_size, dtype=params_dtype),
+                "_param_dims": {
+                    "qweight": {"input_dim": 0, "output_dim": 1},
+                    "scales": {"output_dim": 0},
+                },
+            }
         # Online path: the dense weight is loaded from the checkpoint and
         # quantized in process_weights_after_loading.
         return {
@@ -172,6 +189,22 @@ class AscendW8A16TorchAOLinearScheme(AscendLinearScheme):
         }
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.is_prequant_checkpoint:
+            # Pre-quantized: qweight [K,N] int8 + scales [N] already loaded from
+            # the checkpoint. Just place on device + set up the (symmetric,
+            # per-channel) NPU-op params — no quantization step.
+            out_dtype = layer.scales.dtype
+            output_size = layer.scales.shape[0]
+            device = layer.qweight.device
+            layer.qweight = torch.nn.Parameter(layer.qweight.data.to(device), requires_grad=False)
+            layer.scales = torch.nn.Parameter(layer.scales.data.to(out_dtype).to(device), requires_grad=False)
+            layer.torchao_offset = torch.nn.Parameter(
+                torch.zeros(output_size, dtype=out_dtype, device=device), requires_grad=False
+            )
+            layer.torchao_output_size = output_size
+            layer.torchao_group_size = 0  # per-channel (NPU op rejects group_size == K)
+            return
+
         out_dtype = layer.weight.dtype
         output_size = layer.weight.shape[0]
         device = layer.weight.device

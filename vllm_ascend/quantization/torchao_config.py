@@ -86,6 +86,7 @@ class TorchAOConfig(QuantizationConfig):
         torchao_quant_type: str,
         group_size: int = _DEFAULT_TORCHAO_GROUP_SIZE,
         is_checkpoint_torchao_serialized: bool = False,
+        is_prequant_checkpoint: bool = False,
         modules_to_not_convert: list[str] | None = None,
         quant_config: dict[str, Any] | None = None,
     ):
@@ -95,6 +96,11 @@ class TorchAOConfig(QuantizationConfig):
         self.torchao_quant_type = torchao_quant_type  # "int4wo"/"int8wo"/"fp8wo"
         self.group_size = group_size
         self.is_checkpoint_torchao_serialized = is_checkpoint_torchao_serialized
+        # Flat-tensor pre-quantized checkpoint (T-10): int8 data + scale are
+        # loaded directly (no online re-quant). Distinct from
+        # is_checkpoint_torchao_serialized (which triggers vLLM's native torchao
+        # AQTensor loader). Read from the checkpoint's quantization_config.
+        self.is_prequant_checkpoint = is_prequant_checkpoint
         self.modules_to_not_convert = modules_to_not_convert or []
 
         if torchao_quant_type not in _TORCHAO_SCHEME_KEY:
@@ -138,6 +144,10 @@ class TorchAOConfig(QuantizationConfig):
         # distinguish the two (and would wrongly trigger vLLM's torchao
         # safetensors strategy on a dense checkpoint → "No tensors found").
         is_checkpoint_torchao_serialized = bool(config.get("is_checkpoint_torchao_serialized", False))
+        # Flat-tensor pre-quantized checkpoint (T-10): the model's config.json
+        # quantization_config sets ``"prequant": true``. Loaded with vLLM's
+        # default loader (NOT the native torchao AQTensor loader).
+        is_prequant_checkpoint = bool(config.get("prequant", False))
 
         hf_config = cls.get_from_keys_or(config, ["quant_type"], None)
         if hf_config is None:
@@ -160,6 +170,7 @@ class TorchAOConfig(QuantizationConfig):
             torchao_quant_type,
             group_size=group_size,
             is_checkpoint_torchao_serialized=is_checkpoint_torchao_serialized,
+            is_prequant_checkpoint=is_prequant_checkpoint,
             modules_to_not_convert=list(modules_to_not_convert),
             quant_config=config,
         )
