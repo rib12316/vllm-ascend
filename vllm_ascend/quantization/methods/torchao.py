@@ -244,14 +244,49 @@ class AscendW4A16TorchAOLinearScheme(AscendLinearScheme):
 
     def __init__(self, quant_config: "TorchAOConfig"):
         self.group_size = quant_config.group_size
+        # Flat-tensor pre-quantized checkpoint (T-10): int4 values (as int8
+        # [-8,7]) + per-group scale loaded directly, packed for the NPU op at
+        # load time (no online re-quantization). See AscendW8A16TorchAOLinearScheme.
+        self.is_prequant_checkpoint = getattr(quant_config, "is_prequant_checkpoint", False)
 
     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
+        if self.is_prequant_checkpoint:
+            # Pre-quantized checkpoint: int4 values stored as int8 [K,N] (range
+            # [-8,7]) + per-group(128) scale [G,N], loaded directly. Packing to
+            # the NPU int4 format happens in process_weights_after_loading.
+            num_groups = input_size // self.group_size
+            return {
+                "qweight": torch.empty(input_size, output_size, dtype=torch.int8),
+                "scales": torch.empty(num_groups, output_size, dtype=params_dtype),
+                "_param_dims": {
+                    "qweight": {"input_dim": 0, "output_dim": 1},
+                    "scales": {"input_dim": 0, "output_dim": 1},
+                },
+            }
         return {
             "weight": torch.empty(output_size, input_size, dtype=params_dtype),
             "_param_dims": {"weight": {"input_dim": 1, "output_dim": 0}},
         }
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.is_prequant_checkpoint:
+            # qweight [K,N] int8 (int4 values [-8,7]) + scales [G,N] loaded
+            # directly. Pack to the NPU int4 format (same as the online path's
+            # post-quant step) — no quantization.
+            import torch_npu
+
+            out_dtype = layer.scales.dtype
+            output_size = layer.scales.shape[1]
+            device = layer.qweight.device
+            qweight_packed = torch_npu.npu_convert_weight_to_int4pack(layer.qweight.data.to(device).to(torch.int32))
+            scales = layer.scales.data.to(out_dtype).to(device)
+            layer.qweight = torch.nn.Parameter(qweight_packed, requires_grad=False)
+            layer.scales = torch.nn.Parameter(scales, requires_grad=False)
+            layer.torchao_offset = torch.nn.Parameter(torch.zeros_like(scales), requires_grad=False)
+            layer.torchao_output_size = output_size
+            layer.torchao_group_size = self.group_size
+            return
+
         out_dtype = layer.weight.dtype
         output_size = layer.weight.shape[0]
 
