@@ -33,6 +33,7 @@ import torch
 from gguf import GGMLQuantizationType as WT
 
 from vllm_ascend.quantization.methods.gguf_dequant import dequantize
+from vllm_ascend.quantization.methods.gguf_repack import repack_to_npu
 
 
 def _q8_0_block(d_val: float, qs_vals: torch.Tensor) -> torch.Tensor:
@@ -133,6 +134,44 @@ def test_q5_1_dequant():
     )
     expected = torch.cat([torch.full((16,), 3.5), torch.full((16,), 5.5)])
     torch.testing.assert_close(out[0], expected)
+
+
+def test_q5_0_repack_matches_dequant():
+    # High-perf repack (int8 path) must reconstruct the same weights as dequant.
+    # Same block as test_q5_0_dequant: d=2, qs low=3 high=5 -> (-26, -22).
+    d = torch.tensor([2.0], dtype=torch.float16)
+    qs = torch.full((16,), (5 << 4) | 3, dtype=torch.uint8)
+    block = torch.cat([d.view(torch.uint8), torch.zeros(4, dtype=torch.uint8), qs]).unsqueeze(0)
+    ref = dequantize(block, WT.Q5_0, torch.float32)  # [1, 32]
+    qw, scale, offset, _group = repack_to_npu(block, WT.Q5_0, torch.float16)
+    # NPU op antiquant per group: (qw + offset) * scale; qw is [K,N]=[32,1].
+    recon = (qw.to(torch.float32) + offset.to(torch.float32)) * scale.to(torch.float32)
+    torch.testing.assert_close(recon.t().contiguous(), ref, rtol=1e-3, atol=1e-3)
+
+
+def test_q5_1_repack_matches_dequant():
+    # Same block as test_q5_1_dequant: d=1, m=0.5 -> (3.5, 5.5).
+    dm = torch.tensor([1.0, 0.5], dtype=torch.float16)
+    qs = torch.full((16,), (5 << 4) | 3, dtype=torch.uint8)
+    block = torch.cat([dm.view(torch.uint8), torch.zeros(4, dtype=torch.uint8), qs]).unsqueeze(0)
+    ref = dequantize(block, WT.Q5_1, torch.float32)
+    qw, scale, offset, _group = repack_to_npu(block, WT.Q5_1, torch.float16)
+    recon = (qw.to(torch.float32) + offset.to(torch.float32)) * scale.to(torch.float32)
+    torch.testing.assert_close(recon.t().contiguous(), ref, rtol=1e-3, atol=1e-3)
+
+
+def test_q5_repack_forces_cpu_no_npu_bitop():
+    # Regression guard: repack must run on CPU (the tensor-broadcast right-shift
+    # can't run on NPU: aclnnRightShift 161002). Confirms CPU tensors out + the
+    # Q5_0 symmetric layout (offset=0, int8 qw, group_size=32).
+    d = torch.tensor([2.0], dtype=torch.float16)
+    qs = torch.full((16,), (5 << 4) | 3, dtype=torch.uint8)
+    block = torch.cat([d.view(torch.uint8), torch.zeros(4, dtype=torch.uint8), qs]).unsqueeze(0)
+    qw, _scale, offset, group = repack_to_npu(block, WT.Q5_0, torch.float16)
+    assert qw.device.type == "cpu"
+    assert qw.dtype == torch.int8
+    assert group == 32
+    assert offset.abs().sum().item() == 0.0  # Q5_0 is symmetric
 
 
 def test_q4_k_dequant_sections():

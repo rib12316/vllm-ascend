@@ -140,9 +140,12 @@ class AscendGGUFLinearMethod(LinearMethodBase):
             group_size = None
             for bytes_, qt in shard_specs:
                 qw, sc, off, group_size = repack_to_npu(bytes_.to(device), qt, dtype)
-                qws.append(qw)
-                scales.append(sc)
-                offsets.append(off)
+                # Repack kernels may return CPU tensors (Q5_0/Q5_1 force CPU: the
+                # tensor-broadcast right-shift can't run on NPU). Normalize to the
+                # target device before cat so mixed-type shards concatenate cleanly.
+                qws.append(qw.to(device))
+                scales.append(sc.to(device))
+                offsets.append(off.to(device))
             layer.qweight = Parameter(torch.cat(qws, dim=1).to(device), requires_grad=False)
             layer.scales = Parameter(torch.cat(scales, dim=1).to(device), requires_grad=False)
             layer.offset = Parameter(torch.cat(offsets, dim=1).to(device), requires_grad=False)
