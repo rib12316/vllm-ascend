@@ -157,7 +157,7 @@ class AWQConfig(QuantizationConfig):
         self.modules_to_not_convert = list(layers - quant_layers)
 
     def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
+        self, layer: torch.nn.Module, prefix: str, tid2eid: dict[int, int] | None = None
     ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
         if isinstance(layer, LinearBase):
             if is_layer_skipped(
@@ -183,6 +183,6 @@ class AWQConfig(QuantizationConfig):
             scheme_cls = get_scheme_class("W4A16_AWQ", "moe")
             if scheme_cls is None:
                 raise NotImplementedError(f"W4A16_AWQ moe scheme not found for layer {prefix}")
-            return AscendFusedMoEMethod(scheme_cls(self), layer.moe_config)
+            return AscendFusedMoEMethod(scheme_cls(self), layer.moe_config, tid2eid)
 
         return None

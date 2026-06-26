@@ -424,6 +424,16 @@ def _get_gptq_moe_weight_spec(
             hidden_sizes,
             dtype=torch.int32,
         ),
+        # g_idx: per-input-element group index (activation reorder, desc_act).
+        # Registered even when desc_act=False because GPTQ checkpoints always
+        # store per-expert g_idx tensors, and the model loader (layer.py
+        # ``_load_g_idx``) expects matching ``w13_g_idx``/``w2_g_idx`` params to
+        # exist or it raises KeyError. MoE desc_act is unsupported (see
+        # ``_process_gptq_moe_weights_after_loading``), so these are loaded and
+        # left unused. Shapes are per-expert, one entry per input element:
+        # w13 input = hidden_sizes, w2 input = intermediate_size_per_partition.
+        "w13_g_idx": torch.empty(num_experts, hidden_sizes, dtype=torch.int32),
+        "w2_g_idx": torch.empty(num_experts, intermediate_size_per_partition, dtype=torch.int32),
     }
 
 
@@ -653,6 +663,12 @@ class _AscendGPTQFusedMoEMethodBase(AscendMoEScheme):
         mc2_mask: torch.Tensor | None = None,
         tid2eid: Any | None = None,
     ) -> torch.Tensor:
+        # vLLM passes ``activation`` as a MoEActivation enum (e.g.
+        # MoEActivation.SILU). Normalize to its string value so the guard and
+        # the downstream fused_experts path (build_fused_experts_input expects a
+        # str) both work, whether a str or enum is supplied.
+        if hasattr(activation, "value"):
+            activation = activation.value
         if activation != "silu":
             raise ValueError("Only SiLU activation is supported for Ascend GPTQ MoE.")
 

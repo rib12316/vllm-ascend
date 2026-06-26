@@ -920,10 +920,21 @@ class AscendMLAImpl(MLAAttentionImpl):
         return ql_nope.transpose(0, 1), q_pe
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
-        # NOTE: We currently do not support quant kv_b_proj.
-        assert isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
-        # NOTE: Weight will be reshaped next, we need to revert and transpose it.
-        kv_b_proj_weight = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, ACL_FORMAT_FRACTAL_ND).T
+        if isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod):
+            # NOTE: Weight will be reshaped next, revert and transpose it.
+            kv_b_proj_weight = torch_npu.npu_format_cast(self.kv_b_proj.weight.data, ACL_FORMAT_FRACTAL_ND).T
+        else:
+            # kv_b_proj is weight-quantized (AWQ/GPTQ W4A16). MLA needs a dense
+            # fp16 weight to reshape into W_UK/W_UV, so dequantize by applying
+            # the quant method to an identity input (I @ dequant(W) == dequant(W))
+            # — reuses the verified fused dequant in AscendLinearMethod.apply.
+            in_dim = self.kv_lora_rank
+            eye = torch.eye(in_dim, dtype=act_dtype, device=next(self.kv_b_proj.parameters()).device)
+            kv_b_proj_weight = self.kv_b_proj.quant_method.apply(self.kv_b_proj, eye)
+            # apply(I) already returns the logical (in, out) weight; the fp16
+            # path stores (out, in) and transposes, so we must NOT .T here.
+            kv_b_proj_weight = kv_b_proj_weight.reshape(in_dim, -1)
+            kv_b_proj_weight = torch_npu.npu_format_cast(kv_b_proj_weight, ACL_FORMAT_FRACTAL_ND)
         assert kv_b_proj_weight.shape == (
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -1789,12 +1800,17 @@ class AscendMLAImpl(MLAAttentionImpl):
             o_proj_input[num_decode_tokens:num_actual_tokens] = output_prefill
         # O proj
         weight_prefetch_method = get_weight_prefetch_method()
-        weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
-            inputs=self.o_proj.weight,
-            dependency=o_proj_input,
-            max_size=MAX_O_PROJ_PREFETCH_SIZE,
-            linear_layer=self.o_proj,
-        )
+        # Weight prefetch assumes a dense fp16 .weight; skip for quantized
+        # o_proj (AscendLinearMethod stores qweight, not weight). Prefetch is
+        # a perf optimization, so skipping is functionally safe.
+        _o_proj_weight = getattr(self.o_proj, "weight", None)
+        if _o_proj_weight is not None:
+            weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
+                inputs=_o_proj_weight,
+                dependency=o_proj_input,
+                max_size=MAX_O_PROJ_PREFETCH_SIZE,
+                linear_layer=self.o_proj,
+            )
         output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
 
         del o_proj_input

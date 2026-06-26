@@ -35,8 +35,10 @@ Key differences from AWQ:
 - GPTQ supports both 4-bit and 8-bit weights
 """
 
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Union
 
+import regex as re
 import torch
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -63,6 +65,80 @@ from vllm_ascend.utils import GPTQ_QUANTIZATION_METHOD
 
 from .method_adapters import AscendFusedMoEMethod, AscendLinearMethod
 from .methods import get_scheme_class
+
+
+def get_dynamic_override(
+    config: "GPTQConfig",
+    layer_name: str,
+    key: str | None = None,
+    default_value: int | bool | None = None,
+) -> dict | int | bool | None:
+    """Return the per-module dynamic override for ``layer_name``.
+
+    Ported from upstream ``vllm/model_executor/layers/quantization/utils/
+    gptq_utils.py:get_dynamic_override``. ``config.dynamic`` maps a regex
+    pattern (optionally prefixed with ``+:`` or ``-:``) to an override dict:
+
+    - ``-:<regex>`` (negative match): returns ``False`` — the matched module
+      is excluded from quantization entirely.
+    - ``+:<regex>`` or an unprefixed ``<regex>`` (positive match, the
+      default): returns the override dict (or a single field via ``key``),
+      which overrides the base quant config for that module.
+
+    With ``key=None`` the return distinguishes the three cases:
+    ``False`` (skip) / ``dict`` (positive) / ``default_value`` (no match,
+    ``None`` by default). When ``config.dynamic`` is empty the loop never
+    runs and ``default_value`` is returned, so this is a no-op for the
+    common case of standard GPTQ checkpoints that do not set ``dynamic``.
+    """
+    for pattern, pattern_dict in config.dynamic.items():
+        # Negative match: matched modules are excluded from quantized init.
+        if pattern.startswith("-:"):
+            if re.match(pattern.removeprefix("-:"), layer_name):
+                return False
+        # Positive match (explicit "+:" or unprefixed): matched modules have
+        # quant properties that override the base quant config.
+        elif re.match(pattern.removeprefix("+:"), layer_name):
+            if key is None:
+                return pattern_dict
+            return pattern_dict.get(key, default_value)
+    return default_value
+
+
+def _override_config(config: "GPTQConfig", prefix: str) -> None:
+    """Apply ``+:`` positive dynamic overrides to ``config`` in place.
+
+    Ported from upstream ``override_config`` (the non-Marlin ``gptq`` branch).
+    Mutates ``weight_bits`` / ``group_size`` / ``desc_act`` / ``pack_factor``
+    only when the corresponding field is present in the matched rule, then
+    re-validates ``weight_bits`` with the same rules as
+    ``GPTQConfig.__init__`` (2/3-bit -> NotImplementedError; other
+    unsupported widths -> ValueError), so a bad per-layer override fails
+    fast instead of producing a malformed scheme.
+    """
+    weight_bits = get_dynamic_override(config, prefix, "bits", config.weight_bits)
+    if isinstance(weight_bits, int):
+        config.weight_bits = weight_bits
+    group_size = get_dynamic_override(config, prefix, "group_size", config.group_size)
+    if isinstance(group_size, int):
+        config.group_size = group_size
+    desc_act = get_dynamic_override(config, prefix, "desc_act", config.desc_act)
+    if isinstance(desc_act, bool):
+        config.desc_act = desc_act
+
+    config.pack_factor = 32 // config.weight_bits  # packed into int32
+    if config.weight_bits not in (2, 3, 4, 8):
+        raise ValueError(
+            f"Only 2/3/4/8-bit weight quantization is supported for GPTQ on "
+            f"Ascend, but the dynamic override on '{prefix}' set "
+            f"bits={config.weight_bits}."
+        )
+    if config.weight_bits in (2, 3):
+        raise NotImplementedError(
+            f"GPTQ with {config.weight_bits}-bit weights is not yet supported "
+            f"on Ascend NPU (dynamic override on '{prefix}'). The NPU "
+            f"quantization kernels only support 4-bit and 8-bit packing."
+        )
 
 
 @register_quantization_config(GPTQ_QUANTIZATION_METHOD)
@@ -127,6 +203,17 @@ class GPTQConfig(QuantizationConfig):
 
         # v2 format flag
         self.use_v2_format = checkpoint_format == "gptq_v2"
+
+    def __repr__(self) -> str:
+        return (
+            f"GPTQConfig(weight_bits={self.weight_bits}, "
+            f"group_size={self.group_size}, "
+            f"desc_act={self.desc_act}, "
+            f"lm_head_quantized={self.lm_head_quantized}, "
+            f"dynamic={self.dynamic}, "
+            f"modules_in_block_to_quantize={self.modules_in_block_to_quantize}, "
+            f"checkpoint_format={self.checkpoint_format})"
+        )
 
     def get_name(self) -> str:
         return GPTQ_QUANTIZATION_METHOD
@@ -214,7 +301,7 @@ class GPTQConfig(QuantizationConfig):
         self.modules_in_block_to_quantize = list(quant_layers)
 
     def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
+        self, layer: torch.nn.Module, prefix: str, tid2eid: dict[int, int] | None = None
     ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
         # Handle lm_head: ParallelLMHead is NOT a LinearBase subclass,
         # so we must explicitly check it when lm_head_quantized=True.
@@ -234,33 +321,61 @@ class GPTQConfig(QuantizationConfig):
             # this layer is NOT in the list (i.e., NOT quantized).
             # Note: is_layer_skipped returns True when layer IS in the list,
             # so we invert it: skip when the layer is NOT in the list.
-            if self.modules_in_block_to_quantize and not is_layer_skipped(
+            not_in_quant_list = self.modules_in_block_to_quantize and not is_layer_skipped(
                 prefix,
                 self.modules_in_block_to_quantize,
                 self.packed_modules_mapping,
                 skip_with_substr=True,
-            ):
+            )
+            # GPTQ dynamic config (R7/G18): a "-:<regex>" rule forces a module
+            # OUT of quantization even when it appears in the quantize list;
+            # a "+:<regex>" rule (handled below) overrides the base config per
+            # module. When ``dynamic`` is empty — the default for all standard
+            # GPTQ checkpoints — ``get_dynamic_override`` is not even called,
+            # so this whole block is a no-op and routing is unchanged.
+            # Ported from upstream get_dynamic_override / get_linear_quant_method.
+            dyn = get_dynamic_override(self, prefix) if self.dynamic else None
+            # dyn: None = no rule matched; False = negative match (skip);
+            # dict = positive match (override).
+            if not_in_quant_list or dyn is False:
                 if parallel_lm_head_quantized:
                     return UnquantizedEmbeddingMethod()
                 return AscendUnquantizedLinearMethod()
-            # Pattern A: lookup scheme from registry and wrap with adapter
-            if self.weight_bits == 4:
+            # A positive "+:" rule overrides the base config for this module
+            # (e.g. mixing 4-bit and 8-bit across layers). Apply on a deep copy
+            # so the shared base config (used by every other layer) is untouched.
+            if dyn:
+                quant_config = deepcopy(self)
+                _override_config(quant_config, prefix)
+            else:
+                quant_config = self
+            # Pattern A: lookup scheme from registry and wrap with adapter.
+            # Scheme selection honors an overridden weight_bits (4 vs 8).
+            if quant_config.weight_bits == 4:
                 scheme_name = "W4A16_GPTQ"
-            elif self.weight_bits == 8:
+            elif quant_config.weight_bits == 8:
                 scheme_name = "W8A16_GPTQ"
             else:
-                raise NotImplementedError(f"GPTQ with {self.weight_bits}-bit weights is not supported on Ascend NPU.")
+                raise NotImplementedError(
+                    f"GPTQ with {quant_config.weight_bits}-bit weights is not supported on Ascend NPU."
+                )
             scheme_cls = get_scheme_class(scheme_name, "linear")
             if scheme_cls is None:
                 raise NotImplementedError(f"{scheme_name} linear scheme not found for layer {prefix}")
-            return AscendLinearMethod(scheme_cls(self))
+            return AscendLinearMethod(scheme_cls(quant_config))
 
         elif isinstance(layer, FusedMoE):
-            if self.modules_in_block_to_quantize and not is_layer_skipped(
-                prefix,
-                self.modules_in_block_to_quantize,
-                skip_with_substr=True,
-            ):
+            # Decide whether this FusedMoE is quantized. GPTQ quantizes expert
+            # weights uniformly across MoE layers, so the MoE is quantized iff
+            # the quantize list contains ANY expert submodule (e.g.
+            # "mlp.experts.0.up_proj"). We must NOT use is_layer_skipped() with
+            # skip_with_substr here: it does one-directional substring matching
+            # (entry-in-prefix), but the MoE layer name ("mlp.experts") is the
+            # PARENT of the expert entries, so it never matches and the layer is
+            # wrongly returned as unquantized (upstream GPTQ in fact quantizes
+            # every FusedMoE unconditionally).
+            has_quantized_experts = any("experts" in q for q in self.modules_in_block_to_quantize)
+            if self.modules_in_block_to_quantize and not has_quantized_experts:
                 return AscendUnquantizedFusedMoEMethod(layer.moe_config)
             # Determine quant_type based on weight_bits
             if self.weight_bits == 4:
@@ -274,6 +389,6 @@ class GPTQConfig(QuantizationConfig):
             scheme_cls = get_scheme_class(scheme_name, "moe")
             if scheme_cls is None:
                 raise NotImplementedError(f"{scheme_name} moe scheme not found for layer {prefix}")
-            return AscendFusedMoEMethod(scheme_cls(self), layer.moe_config)
+            return AscendFusedMoEMethod(scheme_cls(self), layer.moe_config, tid2eid)
 
         return None

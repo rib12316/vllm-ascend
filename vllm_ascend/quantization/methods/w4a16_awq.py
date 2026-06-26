@@ -388,6 +388,12 @@ class AscendW4A16AWQFusedMoEMethod(AscendMoEScheme):
         mc2_mask: torch.Tensor | None = None,
         tid2eid: Any | None = None,
     ) -> torch.Tensor:
+        # vLLM passes ``activation`` as a MoEActivation enum (e.g.
+        # MoEActivation.SILU). Normalize to its string value so the guard and
+        # the downstream fused_experts path (build_fused_experts_input expects a
+        # str) both work, whether a str or enum is supplied.
+        if hasattr(activation, "value"):
+            activation = activation.value
         if activation != "silu":
             raise ValueError("Only SiLU activation is supported for Ascend AWQ MoE.")
 

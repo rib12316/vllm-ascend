@@ -231,6 +231,13 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
+        # Match vLLM native GPTQMarlinMoEMethod (gptq_marlin.py:563): ALL MoE
+        # params (qweight/scales/qzeros/g_idx) share is_transposed=True so the
+        # FusedMoE weight_loader shards gate/up (w1/w3) along the output dim
+        # consistently. Previously only qweight had is_transposed; scales/qzeros
+        # used shard_dim=0 and loaded wrong (w13 qzeros gate-half-only,
+        # qzeros effectively zero -> Bug#6: degenerate MoE output).
+        extra_weight_attrs["is_transposed"] = True
         weight_param = self.quant_method.get_weight(
             num_experts, intermediate_size_per_partition, hidden_size, params_dtype
         )
@@ -255,6 +262,9 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
             param = torch.nn.Parameter(param_value, requires_grad=False)
             layer.register_parameter(param_key, param)
             set_weight_attrs(param, extra_weight_attrs)
+            # is_transposed is set uniformly on ALL MoE params via
+            # extra_weight_attrs above (matching vLLM GPTQMarlinMoEMethod);
+            # no per-param override is needed here.
             if any(fields in param_key for fields in per_group_param):
                 param.quant_method = FusedMoeWeightScaleSupported.GROUP.value
 
