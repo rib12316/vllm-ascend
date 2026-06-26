@@ -24,8 +24,8 @@ dequant formulas are ported bit-exactly from
 ``vllm/csrc/quantization/gguf/ggml-common.h`` and the ggml reference
 ``dequantize_row_*`` functions.
 
-Supported block types: Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K (standard + the most
-common k-quant). TODO: Q5_K, Q6_K, IQ variants.
+Supported block types: Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, and the full k-quant
+family Q2_K/Q3_K/Q4_K/Q5_K/Q6_K. TODO: IQ variants (stretch).
 """
 
 import torch
