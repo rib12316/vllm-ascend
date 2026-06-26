@@ -33,7 +33,7 @@ from gguf import GGML_QUANT_SIZES
 from gguf import GGMLQuantizationType as WT
 
 # Quantization types dequantized to dense by this module.
-GGUF_DEQUANT_TYPES = {WT.Q8_0, WT.Q4_0, WT.Q4_1, WT.Q5_0, WT.Q5_1, WT.Q4_K, WT.Q5_K, WT.Q6_K}
+GGUF_DEQUANT_TYPES = {WT.Q8_0, WT.Q4_0, WT.Q4_1, WT.Q5_0, WT.Q5_1, WT.Q4_K, WT.Q5_K, WT.Q6_K, WT.Q2_K, WT.Q3_K}
 # Unquantized GGUF dtypes stored verbatim in the qweight bytes.
 GGUF_UNQUANTIZED_TYPES = {WT.F16, WT.BF16, WT.F32}
 
@@ -254,6 +254,97 @@ def _q5_k(qweight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(n_rows, n_blocks * block_size).to(dtype)
 
 
+def _q2_k(qweight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    r"""block_q2_K {scales[16]; qs[64]; half2 dm (d, dmin)} → 256 values.
+
+    16 sub-blocks of 16 weights. Each sub-block's scale byte holds a 4-bit
+    scale (low nibble) and a 4-bit min-scale (high nibble). Weights are 2-bit
+    (0..3) packed into ``qs`` with a per-j bit ``shift`` (0, 2, 4, 6). Ported
+    from llama.cpp ``dequantize_row_q2_K``. Per sub-block:
+    ``y = d*(sc&0xF)*q2 - dmin*(sc>>4)``.
+    """
+    block_size, type_size = _block_layout(WT.Q2_K)  # 256, 84
+    n_rows, n_bytes = qweight.shape
+    n_blocks = n_bytes // type_size
+    b = qweight.reshape(n_rows, n_blocks, type_size)
+    scales = b[..., 0:16].to(torch.int32)  # [r, nb, 16]
+    qs = b[..., 16:80].to(torch.int32)  # [r, nb, 64]
+    dm = b[..., 80:84].contiguous().view(torch.float16).to(torch.float32)  # [r, nb, 2]
+    dall = dm[..., 0:1]  # [r, nb, 1]
+    dmin = dm[..., 1:2]  # [r, nb, 1]
+    dl = (dall * (scales & 0xF).to(torch.float32))[..., None]  # [r, nb, 16, 1]
+    ml = (dmin * (scales >> 4).to(torch.float32))[..., None]  # [r, nb, 16, 1]
+    # Sub-block is (0..15) -> q_base=(is//8)*32+(is%2)*16, shift=((is%8)//2)*2.
+    is_idx = torch.arange(16, device=qweight.device)
+    q_base = (is_idx // 8) * 32 + (is_idx % 2) * 16
+    shift = ((is_idx % 8) // 2) * 2
+    cols = q_base[:, None] + torch.arange(16, device=qweight.device)[None, :]  # [16, 16]
+    qsub = qs[..., cols]  # [r, nb, 16, 16]
+    w = ((qsub >> shift[:, None]) & 3).to(torch.float32)  # [r, nb, 16, 16]
+    y = dl * w - ml  # [r, nb, 16, 16]
+    return y.reshape(n_rows, n_blocks * block_size).to(dtype)
+
+
+def _unpack_q3k_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Unpack 16 six-bit scales (0..63) from Q3_K's 12 scale bytes.
+
+    Ported from the ``aux`` / ``kmask`` rearrangement in llama.cpp
+    ``dequantize_row_q3_K`` (the 12 raw bytes hold the 16 scales' low nibbles;
+    the high 2 bits are borrowed from ``aux[2]``'s bit-pairs).
+    """
+    s = scales.to(torch.int32)  # [..., 12]
+    a0 = s[..., 0] | (s[..., 1] << 8) | (s[..., 2] << 16) | (s[..., 3] << 24)
+    a1 = s[..., 4] | (s[..., 5] << 8) | (s[..., 6] << 16) | (s[..., 7] << 24)
+    a2 = s[..., 8] | (s[..., 9] << 8) | (s[..., 10] << 16) | (s[..., 11] << 24)
+    tmp = a2
+    kmask1, kmask2 = 0x03030303, 0x0F0F0F0F
+    na0 = (a0 & kmask2) | (((tmp >> 0) & kmask1) << 4)
+    na1 = (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4)
+    na2 = ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4)
+    na3 = ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4)
+    na = torch.stack([na0, na1, na2, na3], dim=-1)  # [..., 4] uint32
+    bytes16 = [((na[..., i] >> (8 * byte)) & 0xFF) for i in range(4) for byte in range(4)]
+    return torch.stack(bytes16, dim=-1)  # [..., 16]
+
+
+def _q3_k(qweight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    r"""block_q3_K {hmask[32]; qs[64]; scales[12]; half d} → 256 values.
+
+    16 sub-blocks of 16 weights. Each weight is 3-bit: the low 2 bits come from
+    ``qs`` (per-j ``shift`` 0/2/4/6), the sign bit from ``hmask`` (bit ``j``):
+    value = ``qbits`` if the hmask bit is set, else ``qbits - 4``. Per sub-block
+    scale is 6-bit (unpacked from ``scales[12]``): ``y = d*(sc-32)*value``.
+    Ported from llama.cpp ``dequantize_row_q3_K``.
+    """
+    block_size, type_size = _block_layout(WT.Q3_K)  # 256, 110
+    n_rows, n_bytes = qweight.shape
+    n_blocks = n_bytes // type_size
+    b = qweight.reshape(n_rows, n_blocks, type_size)
+    hmask = b[..., 0:32].to(torch.int32)  # [r, nb, 32]
+    qs = b[..., 32:96].to(torch.int32)  # [r, nb, 64]
+    d_all = b[..., 108:110].contiguous().view(torch.float16).to(torch.float32)  # [r, nb, 1]
+    scale6 = _unpack_q3k_scales(b[..., 96:108]).to(torch.float32)  # [r, nb, 16]
+    dl = (d_all * (scale6 - 32))[..., None]  # [r, nb, 16, 1]
+    is_idx = torch.arange(16, device=qweight.device)
+    q_base = (is_idx // 8) * 32 + (is_idx % 2) * 16
+    j = (is_idx % 8) // 2
+    shift = j * 2
+    cols = q_base[:, None] + torch.arange(16, device=qweight.device)[None, :]  # [16, 16]
+    # hmask does NOT advance with n (only q does in the C reference): its byte
+    # index depends on sub only (A→hm[0:16], B→hm[16:32]), reusing hm[0:32] both
+    # n-halves. The bit WITHIN the byte is m, which the C reference left-shifts
+    # once per j across BOTH n-halves (8 shifts total) -> bit = n*4 + j (0..7).
+    hm_cols = (is_idx % 2)[:, None] * 16 + torch.arange(16, device=qweight.device)[None, :]
+    bit_idx = ((is_idx // 8) * 4 + j)[:, None]  # [16, 1]
+    qsub = qs[..., cols]  # [r, nb, 16, 16]
+    hsub = hmask[..., hm_cols]  # [r, nb, 16, 16]
+    qbits = (qsub >> shift[:, None]) & 3  # [r, nb, 16, 16]
+    hbit = (hsub >> bit_idx) & 1  # [r, nb, 16, 16]
+    value = (qbits - 4 * (1 - hbit)).to(torch.float32)  # hbit=1→qbits; hbit=0→qbits-4
+    y = dl * value  # [r, nb, 16, 16]
+    return y.reshape(n_rows, n_blocks * block_size).to(dtype)
+
+
 _DEQUANT_KERNELS = {
     WT.Q8_0: _q8_0,
     WT.Q4_0: _q4_0,
@@ -263,6 +354,8 @@ _DEQUANT_KERNELS = {
     WT.Q4_K: _q4_k,
     WT.Q5_K: _q5_k,
     WT.Q6_K: _q6_k,
+    WT.Q2_K: _q2_k,
+    WT.Q3_K: _q3_k,
 }
 
 
