@@ -160,6 +160,41 @@ def test_q5_1_repack_matches_dequant():
     torch.testing.assert_close(recon.t().contiguous(), ref, rtol=1e-3, atol=1e-3)
 
 
+def _mock_int4pack_passthrough(monkeypatch):
+    """npu_convert_weight_to_int4pack needs NPU hardware; for a CPU bit-exact
+    test of the repack MATH (nibble-unpack + scale/offset derivation), pass the
+    pre-pack signed int4 values through unchanged. The int4pack packing format
+    itself is validated by the Q4_0 real-model e2e ("Paris")."""
+    import torch_npu
+
+    monkeypatch.setattr(torch_npu, "npu_convert_weight_to_int4pack", lambda w: w.to(torch.int8))
+
+
+def test_q4_0_repack_matches_dequant(monkeypatch):
+    # Q4_0 high-perf repack (symmetric int4: nibble-8, scale=d, offset=0) must
+    # reconstruct dequant. Same block as test_q4_0_dequant_low_high_ordering:
+    # d=2, low=3 high=5 -> ((3-8)*2, (5-8)*2) = (-10, -6).
+    _mock_int4pack_passthrough(monkeypatch)
+    block = _q4_0_block(2.0, low_nib=3, high_nib=5)
+    ref = dequantize(block, WT.Q4_0, torch.float32)  # [1, 32]
+    qw, scale, offset, _group = repack_to_npu(block, WT.Q4_0, torch.float16)
+    recon = (qw.to(torch.float32) + offset.to(torch.float32)) * scale.to(torch.float32)
+    torch.testing.assert_close(recon.t().contiguous(), ref, rtol=1e-3, atol=1e-3)
+
+
+def test_q4_1_repack_matches_dequant(monkeypatch):
+    # Q4_1 high-perf repack (asymmetric int4: nibble, scale=d, offset=m/d+8)
+    # must reconstruct dequant — closes the Q4_1 gap (no real q4_1.gguf available
+    # in any repo, so the high-perf path is validated here at the unit level).
+    # Same block as test_q4_1_dequant_asymmetric: d=1, m=0.5 -> (3.5, 5.5).
+    _mock_int4pack_passthrough(monkeypatch)
+    block = _q4_1_block(1.0, 0.5, low_nib=3, high_nib=5)
+    ref = dequantize(block, WT.Q4_1, torch.float32)  # [1, 32]
+    qw, scale, offset, _group = repack_to_npu(block, WT.Q4_1, torch.float16)
+    recon = (qw.to(torch.float32) + offset.to(torch.float32)) * scale.to(torch.float32)
+    torch.testing.assert_close(recon.t().contiguous(), ref, rtol=1e-3, atol=1e-3)
+
+
 def test_q5_repack_forces_cpu_no_npu_bitop():
     # Regression guard: repack must run on CPU (the tensor-broadcast right-shift
     # can't run on NPU: aclnnRightShift 161002). Confirms CPU tensors out + the
