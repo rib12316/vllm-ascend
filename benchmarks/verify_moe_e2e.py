@@ -17,11 +17,20 @@ path and real-checkpoint loading. This script closes that gap: it loads the two
 real MoE models on disk, confirms our Ascend MoE quant method is attached, and
 checks generated output is sane (correct + non-degenerate).
 
+Each model runs in its OWN SUBPROCESS. vLLM retains its KV-cache pool in global
+state, so ``del llm; gc.collect(); torch.npu.empty_cache()`` in-process does NOT
+reclaim the ~50 GB HBM allocation — the next model then fails to load. A fresh
+process per model is the only reliable release (process death frees everything),
+mirroring the subprocess-per-model design in ``benchmark_awq_gptq.py``.
+
 Run from the vllm-ascend/ directory with the venv active:
 
     python benchmarks/verify_moe_e2e.py 2>&1 | tee logs/<date>_T3T4_moe-e2e.log
 """
 
+import json
+import os
+import subprocess
 import sys
 import traceback
 
@@ -54,13 +63,16 @@ MODELS = [
     },
 ]
 
-
 # Allow focusing on one quant flavor via env (e.g. MOE_ONLY=gptq) so iterative
 # debugging isn't blocked waiting on a known-failing model.
-import os as _os
-_moe_only = _os.environ.get("MOE_ONLY", "")
+_moe_only = os.environ.get("MOE_ONLY", "")
 if _moe_only:
     MODELS = [m for m in MODELS if _moe_only.lower() in m["tag"].lower()]
+
+# Child-process result marker: the child prints ``<SENTINEL><json>`` so the
+# parent can recover the result dict from among vLLM's log noise.
+_RESULT_SENTINEL = "__MOE_E2E_RESULT__"
+_CHILD_FLAG = "VLLM_MOE_E2E_CHILD"
 
 
 def _is_degenerate(text: str) -> tuple[bool, str]:
@@ -104,7 +116,11 @@ def _probe_moe_quant_method(llm: LLM) -> str:
 
 
 def run_one(cfg: dict) -> dict:
-    """Load + generate for one model. Returns a result dict; never raises."""
+    """Load + generate for one model. Returns a result dict; never raises.
+
+    Runs in a child process (see ``main``), so there is no in-process HBM
+    cleanup — process exit releases all NPU memory for the next model.
+    """
     res = {**{k: cfg[k] for k in ("tag", "model", "quantization")}, "load_ok": False, "gen_ok": None, "detail": []}
     try:
         llm = LLM(
@@ -144,20 +160,57 @@ def run_one(cfg: dict) -> dict:
         snippet = text.replace("\n", " ")[:80]
         res["detail"].append(f"[{flag}] Q={q!r} expect~{expected!r} -> {snippet!r}" + (f" ({why})" if degen else ""))
     res["gen_ok"] = all_ok
-    # Free the model before the next one to reclaim HBM.
-    del llm
-    torch.npu.empty_cache() if torch.npu.is_available() else None
     return res
 
 
+def _run_child() -> int:
+    """Child mode: MOE_ONLY filters MODELS to exactly one; run it and print the
+    result as ``<SENTINEL><json>`` for the parent to collect."""
+    cfg = MODELS[0]
+    r = run_one(cfg)
+    print(_RESULT_SENTINEL + json.dumps(r, ensure_ascii=False))
+    return 0
+
+
+def _run_model_subprocess(cfg: dict) -> dict:
+    """Spawn a fresh Python process for one model so vLLM's global KV-cache pool
+    is fully released on exit (in-process gc/empty_cache is insufficient)."""
+    env = dict(os.environ)
+    env[_CHILD_FLAG] = "1"
+    env["MOE_ONLY"] = cfg["tag"]
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__)],
+        env=env,
+        cwd="/data/ascend/vllm-ascend",
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    for line in proc.stdout.splitlines():
+        if line.startswith(_RESULT_SENTINEL):
+            return json.loads(line[len(_RESULT_SENTINEL) :])
+    # No result line — child crashed before emitting one.
+    return {
+        **{k: cfg[k] for k in ("tag", "model", "quantization")},
+        "load_ok": False,
+        "gen_ok": None,
+        "detail": [f"CHILD FAILED (exit {proc.returncode})", proc.stderr[-3000:]],
+    }
+
+
 def main() -> int:
+    # Child mode: run exactly one (MOE_ONLY-filtered) model and emit its result.
+    if os.environ.get(_CHILD_FLAG) == "1":
+        return _run_child()
+
     print("=" * 64)
     print(" AWQ/GPTQ MoE end-to-end verification on Ascend NPU")
     print(f" torch {torch.__version__} | torch_npu {torch_npu_ver()}")
     print(f" NPU available: {torch.npu.is_available()}")
     print("=" * 64)
 
-    results = [run_one(c) for c in MODELS]
+    # Parent mode: one fresh subprocess per model (full HBM release between).
+    results = [_run_model_subprocess(c) for c in MODELS]
 
     print("\n" + "=" * 64)
     print(" SUMMARY")
@@ -173,13 +226,15 @@ def main() -> int:
             print(f"    {line}")
 
     n_fail = sum(1 for r in results if not (r["load_ok"] and r["gen_ok"]))
-    print("\n" + ("ALL PASS — MoE path verified end-to-end" if n_fail == 0 else f"{n_fail} model(s) need investigation"))
+    msg = "ALL PASS — MoE path verified end-to-end" if n_fail == 0 else f"{n_fail} model(s) need investigation"
+    print("\n" + msg)
     return 0 if n_fail == 0 else 1
 
 
 def torch_npu_ver() -> str:
     try:
         import torch_npu
+
         return torch_npu.__version__
     except Exception:  # noqa: BLE001
         return "?"
