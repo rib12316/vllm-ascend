@@ -31,10 +31,11 @@ Usage:
     pytest tests/quantization/test_quant_routing.py -v
 """
 
-import pytest
-import torch
+import glob
 from unittest.mock import MagicMock
 
+import pytest
+import torch
 from vllm.config import set_current_vllm_config
 
 
@@ -48,15 +49,12 @@ def default_vllm_config():
     with set_current_vllm_config(mock_config):
         yield mock_config
 
+
 # TinyLlama GPTQ snapshot (already on disk) — used for the real-model
 # maybe_update_config (T16) test. Resolved lazily so collection does not fail
 # if the cache is absent.
-import glob
 
-_TINYLLAMA_SNAPSHOTS = (
-    "/data/huggingface_home/hub/"
-    "models--TheBloke--TinyLlama-1.1B-Chat-v1.0-GPTQ/snapshots/*/"
-)
+_TINYLLAMA_SNAPSHOTS = "/data/huggingface_home/hub/models--TheBloke--TinyLlama-1.1B-Chat-v1.0-GPTQ/snapshots/*/"
 
 
 def _tinyllama_path():
@@ -153,8 +151,7 @@ class TestGroupSizeValidation:
         cfg = AWQConfig(weight_bits=4, group_size=128, zero_point=True)
         scheme = AscendW4A16AWQLinearScheme(cfg)
         with pytest.raises(ValueError, match="divisible"):
-            scheme.get_weight(input_size=100, output_size=256,
-                              params_dtype=torch.float16)
+            scheme.get_weight(input_size=100, output_size=256, params_dtype=torch.float16)
 
     def test_awq_linear_alignment_get_pergroup_param(self):
         from vllm_ascend.quantization.awq_config import AWQConfig
@@ -165,8 +162,7 @@ class TestGroupSizeValidation:
         cfg = AWQConfig(weight_bits=4, group_size=128, zero_point=True)
         scheme = AscendW4A16AWQLinearScheme(cfg)
         with pytest.raises(ValueError, match="divisible"):
-            scheme.get_pergroup_param(input_size=100, output_size=256,
-                                      params_dtype=torch.float16)
+            scheme.get_pergroup_param(input_size=100, output_size=256, params_dtype=torch.float16)
 
     def test_gptq_linear_alignment(self):
         from vllm_ascend.quantization.gptq_config import GPTQConfig
@@ -177,8 +173,7 @@ class TestGroupSizeValidation:
         cfg = GPTQConfig(weight_bits=4, group_size=128, desc_act=False)
         scheme = AscendW4A16GPTQLinearScheme(cfg)
         with pytest.raises(ValueError, match="divisible"):
-            scheme.get_pergroup_param(input_size=100, output_size=256,
-                                      params_dtype=torch.float16)
+            scheme.get_pergroup_param(input_size=100, output_size=256, params_dtype=torch.float16)
 
     def test_awq_linear_alignment_accepts_valid(self):
         from vllm_ascend.quantization.awq_config import AWQConfig
@@ -188,8 +183,7 @@ class TestGroupSizeValidation:
 
         cfg = AWQConfig(weight_bits=4, group_size=128, zero_point=True)
         scheme = AscendW4A16AWQLinearScheme(cfg)
-        spec = scheme.get_weight(input_size=256, output_size=256,
-                                 params_dtype=torch.float16)
+        spec = scheme.get_weight(input_size=256, output_size=256, params_dtype=torch.float16)
         # qweight shape: (input_size, output_size // pack_factor)
         assert spec["qweight"].shape == (256, 256 // 8)
 
@@ -208,8 +202,7 @@ class TestLMHeadRouting:
     def _make_config(self, lm_head_quantized):
         from vllm_ascend.quantization.gptq_config import GPTQConfig
 
-        cfg = GPTQConfig(weight_bits=4, group_size=128, desc_act=False,
-                         lm_head_quantized=lm_head_quantized)
+        cfg = GPTQConfig(weight_bits=4, group_size=128, desc_act=False, lm_head_quantized=lm_head_quantized)
         # packed_modules_mapping is normally populated by the model loader;
         # set an empty mapping so get_quant_method works standalone.
         cfg.packed_modules_mapping = {}
@@ -219,14 +212,15 @@ class TestLMHeadRouting:
         from vllm.model_executor.layers.vocab_parallel_embedding import (
             ParallelLMHead,
         )
+
         from vllm_ascend.quantization.method_adapters import AscendLinearMethod
 
         cfg = self._make_config(lm_head_quantized=True)
         lm_head = MagicMock(spec=ParallelLMHead)
         method = cfg.get_quant_method(lm_head, prefix="lm_head")
         assert isinstance(method, AscendLinearMethod), (
-            "lm_head_quantized=True must route ParallelLMHead to the "
-            "quantization path, got %r" % type(method))
+            f"lm_head_quantized=True must route ParallelLMHead to the quantization path, got {type(method)!r}"
+        )
 
     def test_lm_head_not_quantized_returns_none(self):
         from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -237,8 +231,8 @@ class TestLMHeadRouting:
         lm_head = MagicMock(spec=ParallelLMHead)
         method = cfg.get_quant_method(lm_head, prefix="lm_head")
         assert method is None, (
-            "lm_head_quantized=False must leave ParallelLMHead unquantized "
-            "(return None), got %r" % type(method))
+            f"lm_head_quantized=False must leave ParallelLMHead unquantized (return None), got {type(method)!r}"
+        )
 
     def test_lm_head_skipped_when_not_in_block_list(self):
         # When modules_in_block_to_quantize is populated but lm_head is NOT
@@ -247,11 +241,9 @@ class TestLMHeadRouting:
         from vllm.model_executor.layers.vocab_parallel_embedding import (
             ParallelLMHead,
         )
-        from vllm_ascend.quantization.method_adapters import AscendLinearMethod
 
         cfg = self._make_config(lm_head_quantized=True)
-        cfg.modules_in_block_to_quantize = [
-            "model.layers.0.self_attn.q_proj"]
+        cfg.modules_in_block_to_quantize = ["model.layers.0.self_attn.q_proj"]
         lm_head = MagicMock(spec=ParallelLMHead)
         method = cfg.get_quant_method(lm_head, prefix="lm_head")
         # lm_head not in the quant list but lm_head_quantized=True -> still
@@ -291,20 +283,16 @@ class TestGPTQSkipLogic:
         from vllm_ascend.quantization.method_adapters import AscendLinearMethod
 
         cfg = self._make_config()
-        cfg.modules_in_block_to_quantize = [
-            "model.layers.0.self_attn.q_proj"]
-        method = cfg.get_quant_method(
-            self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
+        cfg.modules_in_block_to_quantize = ["model.layers.0.self_attn.q_proj"]
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
         assert isinstance(method, AscendLinearMethod)
 
     def test_layer_not_in_quant_list_is_unquantized(self):
         from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 
         cfg = self._make_config()
-        cfg.modules_in_block_to_quantize = [
-            "model.layers.0.self_attn.q_proj"]
-        method = cfg.get_quant_method(
-            self._linear_layer(), prefix="model.layers.0.mlp.gate_proj")
+        cfg.modules_in_block_to_quantize = ["model.layers.0.self_attn.q_proj"]
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.mlp.gate_proj")
         assert isinstance(method, AscendUnquantizedLinearMethod)
 
     def test_empty_quant_list_quantizes_all(self):
@@ -314,8 +302,7 @@ class TestGPTQSkipLogic:
 
         cfg = self._make_config()
         # leave modules_in_block_to_quantize empty
-        method = cfg.get_quant_method(
-            self._linear_layer(), prefix="model.layers.0.mlp.down_proj")
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.mlp.down_proj")
         assert isinstance(method, AscendLinearMethod)
 
 
@@ -337,14 +324,11 @@ class TestApplyVLLMMapper:
         cfg.modules_in_block_to_quantize = ["model.layers.0.self_attn.q_proj"]
 
         mapper = MagicMock()
-        mapper.apply_list.return_value = [
-            "model.layers.0.self_attn.qkv_proj"]
+        mapper.apply_list.return_value = ["model.layers.0.self_attn.qkv_proj"]
         cfg.apply_vllm_mapper(mapper)
 
-        mapper.apply_list.assert_called_once_with(
-            ["model.layers.0.self_attn.q_proj"])
-        assert cfg.modules_in_block_to_quantize == [
-            "model.layers.0.self_attn.qkv_proj"]
+        mapper.apply_list.assert_called_once_with(["model.layers.0.self_attn.q_proj"])
+        assert cfg.modules_in_block_to_quantize == ["model.layers.0.self_attn.qkv_proj"]
 
     def test_awq_mapper_translates_skip_list(self):
         from vllm_ascend.quantization.awq_config import AWQConfig
@@ -446,8 +430,7 @@ class TestMaybeUpdateConfig:
             ["layer1.q_proj"],
         ]
         cfg.maybe_update_config("dummy-model")
-        assert cfg.modules_in_block_to_quantize == [
-            "layer0.q_proj", "layer0.k_proj", "layer1.q_proj"]
+        assert cfg.modules_in_block_to_quantize == ["layer0.q_proj", "layer0.k_proj", "layer1.q_proj"]
 
     def test_awq_auto_detect_with_mocked_metadata(self, monkeypatch):
         from vllm_ascend.quantization.awq_config import AWQConfig
@@ -490,6 +473,180 @@ class TestMaybeUpdateConfig:
         assert any("q_proj" in name for name in block)
         # lm_head / embed_tokens should NOT be marked quantized for TinyLlama.
         assert "lm_head" not in block
+
+
+# ---------------------------------------------------------------------------
+# G18 / R7: GPTQ dynamic per-module override (+: / -: rules)
+# ---------------------------------------------------------------------------
+
+
+class TestGPTQDynamicOverride:
+    """GPTQModel ``dynamic`` config allows per-module overrides via regex rules:
+
+      "+:<regex>": {"bits": 8, ...}  -> override base config for matched modules
+      "-:<regex>": {}                -> skip quantization for matched modules
+      "<regex>"    (no prefix)       -> treated as a positive match
+
+    Previously the project read ``dynamic`` from the checkpoint but never
+    consumed it, so these rules were silently ignored (R7/G18). These tests
+    verify the ported ``get_dynamic_override`` / ``_override_config`` and the
+    wiring in ``get_quant_method``. All pure Python — no NPU needed.
+    """
+
+    def _make_config(self, dynamic=None, weight_bits=4):
+        from vllm_ascend.quantization.gptq_config import GPTQConfig
+
+        cfg = GPTQConfig(
+            weight_bits=weight_bits,
+            group_size=128,
+            desc_act=False,
+            dynamic=dynamic,
+        )
+        cfg.packed_modules_mapping = {}
+        # Put every proj in the quantize list so skip decisions come only from
+        # the dynamic rules, not from modules_in_block_to_quantize.
+        cfg.modules_in_block_to_quantize = [
+            f"model.layers.{i}.{p}" for i in range(4) for p in ("self_attn.q_proj", "mlp.gate_proj")
+        ]
+        return cfg
+
+    def _linear_layer(self):
+        from vllm.model_executor.layers.linear import LinearBase
+
+        return MagicMock(spec=LinearBase)
+
+    # -- get_dynamic_override / _override_config unit-level -----------------
+
+    def test_get_dynamic_override_negative_returns_false(self):
+        from vllm_ascend.quantization.gptq_config import get_dynamic_override
+
+        cfg = self._make_config({"-:model.layers.0.": {}})
+        assert get_dynamic_override(cfg, "model.layers.0.self_attn.q_proj") is False
+
+    def test_get_dynamic_override_positive_returns_dict(self):
+        from vllm_ascend.quantization.gptq_config import get_dynamic_override
+
+        cfg = self._make_config({"+:model.layers.1.": {"bits": 8}})
+        assert get_dynamic_override(cfg, "model.layers.1.mlp.gate_proj") == {"bits": 8}
+
+    def test_get_dynamic_override_field_lookup(self):
+        from vllm_ascend.quantization.gptq_config import get_dynamic_override
+
+        cfg = self._make_config({"+:model.layers.1.": {"bits": 8, "group_size": 64}})
+        assert get_dynamic_override(cfg, "model.layers.1.mlp.gate_proj", "bits") == 8
+        assert get_dynamic_override(cfg, "model.layers.1.mlp.gate_proj", "group_size") == 64
+        # Missing field falls back to default_value.
+        assert get_dynamic_override(cfg, "model.layers.1.mlp.gate_proj", "desc_act", True) is True
+
+    def test_get_dynamic_override_no_match_returns_default(self):
+        from vllm_ascend.quantization.gptq_config import get_dynamic_override
+
+        cfg = self._make_config({"-:model.layers.0.": {}})
+        assert get_dynamic_override(cfg, "model.layers.3.mlp.gate_proj") is None
+        # Empty dynamic => always the default.
+        cfg_empty = self._make_config({})
+        assert get_dynamic_override(cfg_empty, "model.layers.0.self_attn.q_proj") is None
+
+    def test_override_config_mutates_copy_only(self):
+        from copy import deepcopy
+
+        from vllm_ascend.quantization.gptq_config import _override_config
+
+        cfg = self._make_config({"+:model.layers.1.": {"bits": 8, "group_size": 64}})
+        cloned = deepcopy(cfg)
+        _override_config(cloned, "model.layers.1.mlp.gate_proj")
+        assert cloned.weight_bits == 8
+        assert cloned.group_size == 64
+        assert cloned.pack_factor == 4  # 32 // 8
+        # Base config untouched.
+        assert cfg.weight_bits == 4
+        assert cfg.group_size == 128
+
+    def test_override_config_rejects_2bit(self):
+        from copy import deepcopy
+
+        from vllm_ascend.quantization.gptq_config import _override_config
+
+        cfg = self._make_config({"+:model.layers.0.": {"bits": 2}})
+        with pytest.raises(NotImplementedError, match="2-bit"):
+            _override_config(deepcopy(cfg), "model.layers.0.self_attn.q_proj")
+
+    # -- get_quant_method wiring --------------------------------------------
+
+    def test_empty_dynamic_quantizes_in_list_layer(self):
+        # Safety property: empty dynamic => identical to pre-dynamic behavior.
+        from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+
+        cfg = self._make_config()
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
+        assert isinstance(method, AscendLinearMethod)
+        assert method.quant_method.weight_bits == 4
+
+    def test_negative_match_forces_skip(self):
+        # Layer 0 is in the quantize list, but a "-:" rule must force it out.
+        from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+
+        cfg = self._make_config({"-:model.layers.0.": {}})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
+        assert isinstance(method, AscendUnquantizedLinearMethod)
+
+    def test_negative_match_does_not_affect_other_layers(self):
+        from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+
+        cfg = self._make_config({"-:model.layers.0.": {}})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.1.mlp.gate_proj")
+        assert isinstance(method, AscendLinearMethod)
+
+    def test_positive_match_overrides_bits_w4_to_w8(self):
+        from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+
+        cfg = self._make_config({"+:model.layers.1.": {"bits": 8}})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.1.mlp.gate_proj")
+        assert isinstance(method, AscendLinearMethod)
+        # W8A16_GPTQ scheme selected, and group_size override carried through.
+        assert method.quant_method.weight_bits == 8
+        assert method.quant_method.pack_factor == 4
+
+    def test_positive_match_overrides_group_size(self):
+        from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+
+        cfg = self._make_config({"+:model.layers.1.": {"group_size": 64}})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.1.mlp.gate_proj")
+        assert isinstance(method, AscendLinearMethod)
+        assert method.quant_method.group_size == 64
+        # Base width unchanged.
+        assert cfg.weight_bits == 4
+
+    def test_unprefixed_pattern_is_positive(self):
+        from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+
+        cfg = self._make_config({"model.layers.0.": {"bits": 8}})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
+        assert isinstance(method, AscendLinearMethod)
+        assert method.quant_method.weight_bits == 8
+
+    def test_regex_positive_match_layer_range(self):
+        # "+:" only overrides config for layers ALREADY in the quantize list
+        # (matching upstream: ``not is_layer_quantized`` short-circuits to
+        # unquantized before the override is applied). The quantize list here
+        # covers layers 0-3; this regex matches layers 1-2 and overrides them
+        # to 8-bit, while layer 0 keeps the base 4-bit.
+        from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+
+        cfg = self._make_config({r"+:.*\.(?:[1-2])\..*": {"bits": 8}})
+        # Layer 1 is in the list and matches -> 8-bit.
+        m_match = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.1.mlp.gate_proj")
+        assert isinstance(m_match, AscendLinearMethod)
+        assert m_match.quant_method.weight_bits == 8
+        # Layer 0 is in the list but does not match -> base 4-bit.
+        m_nomatch = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
+        assert isinstance(m_nomatch, AscendLinearMethod)
+        assert m_nomatch.quant_method.weight_bits == 4
+
+    def test_positive_override_to_2bit_rejected_at_routing(self):
+        cfg = self._make_config({"+:model.layers.0.": {"bits": 2}})
+        with pytest.raises(NotImplementedError, match="2-bit"):
+            cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
 
 
 if __name__ == "__main__":
