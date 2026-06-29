@@ -41,7 +41,7 @@ _RESULT_SENTINEL = "__MOE_ACC_RESULT__"
 _CHILD_FLAG = "VLLM_MOE_ACC_CHILD"
 
 
-def _child_script(model, quant, label, tasks, limit, max_model_len, batch):
+def _child_script(model, quant, label, tasks, limit, max_model_len, batch, max_num_seqs):
     limit_arg = f"limit={limit}," if limit else ""
     return f"""
 import json
@@ -50,7 +50,8 @@ import lm_eval
 res = lm_eval.simple_evaluate(
     model="vllm",
     model_args="pretrained={model},quantization={quant},dtype=float16,"
-               "max_model_len={max_model_len},gpu_memory_utilization=0.85,enforce_eager=True,"
+               "max_model_len={max_model_len},max_num_seqs={max_num_seqs},"
+               "gpu_memory_utilization=0.85,enforce_eager=True,"
                "trust_remote_code=True",
     tasks={tasks!r},
     {limit_arg}batch_size={batch},
@@ -62,12 +63,12 @@ print("{_RESULT_SENTINEL}" + json.dumps(out, ensure_ascii=False))
 """
 
 
-def _run_model(model, quant, label, tasks, limit, max_model_len, batch):
+def _run_model(model, quant, label, tasks, limit, max_model_len, batch, max_num_seqs):
     """Spawn a fresh process per model (full vLLM HBM release between)."""
     env = dict(os.environ)
     env[_CHILD_FLAG] = "1"
     proc = subprocess.run(
-        [sys.executable, "-c", _child_script(model, quant, label, tasks, limit, max_model_len, batch)],
+        [sys.executable, "-c", _child_script(model, quant, label, tasks, limit, max_model_len, batch, max_num_seqs)],
         env=env,
         cwd="/data/ascend/vllm-ascend",
         capture_output=True,
@@ -95,20 +96,29 @@ def main():
     parser.add_argument(
         "--batch", default="auto", help='lm_eval batch_size ("auto" or an int; 1 avoids MLA padding-tiling).'
     )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help="vLLM max_num_seqs cap; a small value (e.g. 4) avoids the MLA INT8-KV attention "
+        "tiling failure that large-batch lm_eval loglikelihood hits on DeepSeek-V2-Lite-AWQ.",
+    )
     args = parser.parse_args()
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
     # "auto" → '"auto"' (string); int → bare int, for the f-string in _child_script.
     batch = '"auto"' if args.batch.lower() == "auto" else int(args.batch)
+    mns = args.max_num_seqs if args.max_num_seqs is not None else 1024
 
     print(
         f"MoE Downstream-Accuracy Eval — lm_eval --model vllm, tasks={tasks}, "
-        f"limit={args.limit}, max_model_len={args.max_model_len}, batch={batch}, UNPAIRED\n"
+        f"limit={args.limit}, max_model_len={args.max_model_len}, max_num_seqs={mns}, "
+        f"batch={batch}, UNPAIRED\n"
     )
 
     results = []
     for model, quant, label in MODELS:
         print(f"\n=== {label}: {model} ({quant}) — start {time.strftime('%H:%M:%S')} ===")
-        r = _run_model(model, quant, label, tasks, args.limit, args.max_model_len, batch)
+        r = _run_model(model, quant, label, tasks, args.limit, args.max_model_len, batch, mns)
         r = {"label": label, "model": model, "quantization": quant, **r}
         results.append(r)
         print(f"=== {label} done: {r} ===")
