@@ -55,7 +55,7 @@ python benchmarks/benchmark_awq_gptq.py --label run_all
 step "4/5 real-MoE throughput (unpaired)"
 python benchmarks/benchmark_moe_throughput.py
 
-step "5/5 real-MoE accuracy (lm_eval, GPTQ; AWQ MLA may hit tiling)"
-python benchmarks/eval_moe_accuracy.py --limit 500 --max-model-len 1024
+step "5/5 real-MoE accuracy (lm_eval, GPTQ + AWQ via --max-num-seqs 4)"
+python benchmarks/eval_moe_accuracy.py --limit 500 --max-model-len 1024 --max-num-seqs 4
 
 echo "Done. See logs/ for each step's full output."
