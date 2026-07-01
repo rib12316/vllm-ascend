@@ -18,7 +18,7 @@
 """GPTQ quantization config for Ascend NPU.
 
 This config replaces vLLM's native ``GPTQConfig`` to route linear and MoE
-layers through Ascend-specific scheme implementations (Pattern A):
+layers through Ascend-specific scheme implementations (Ascend Scheme 框架):
 
 - **Linear layers** → ``AscendW4A16GPTQLinearScheme`` or
   ``AscendW8A16GPTQLinearScheme`` (registered via ``@register_scheme``,
@@ -349,7 +349,7 @@ class GPTQConfig(QuantizationConfig):
                 _override_config(quant_config, prefix)
             else:
                 quant_config = self
-            # Pattern A: lookup scheme from registry and wrap with adapter.
+            # Ascend Scheme 框架: lookup scheme from registry and wrap with adapter.
             # Scheme selection honors an overridden weight_bits (4 vs 8).
             if quant_config.weight_bits == 4:
                 scheme_name = "W4A16_GPTQ"

@@ -18,7 +18,7 @@
 """AWQ quantization config for Ascend NPU.
 
 This config replaces vLLM's native ``AWQConfig`` to route linear and MoE
-layers through Ascend-specific scheme implementations (Pattern A):
+layers through Ascend-specific scheme implementations (Ascend Scheme 框架):
 
 - **Linear layers** → ``AscendW4A16AWQLinearScheme`` (registered via
   ``@register_scheme``, dispatched through ``AscendLinearMethod`` adapter)
@@ -167,7 +167,7 @@ class AWQConfig(QuantizationConfig):
                 skip_with_substr=True,
             ):
                 return AscendUnquantizedLinearMethod()
-            # Pattern A: lookup scheme from registry and wrap with adapter
+            # Ascend Scheme 框架: lookup scheme from registry and wrap with adapter
             scheme_cls = get_scheme_class("W4A16_AWQ", "linear")
             if scheme_cls is None:
                 raise NotImplementedError(f"W4A16_AWQ linear scheme not found for layer {prefix}")

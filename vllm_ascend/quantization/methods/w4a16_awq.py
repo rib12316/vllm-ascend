@@ -115,7 +115,7 @@ def _unpack_weight_from_int32(
 
 @register_scheme("W4A16_AWQ", "linear")
 class AscendW4A16AWQLinearScheme(AscendLinearScheme):
-    """Linear scheme for Ascend W4A16 AWQ quantization (Pattern A).
+    """Linear scheme for Ascend W4A16 AWQ quantization (Ascend Scheme 框架).
 
     Uses autonomous weight registration via ``get_weight()`` /
     ``get_pergroup_param()`` instead of delegating to vLLM's

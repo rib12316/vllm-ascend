@@ -32,7 +32,7 @@ Weight processing pipeline:
   4-bit: unpack (standard order) → subtract 8 → npu_convert_weight_to_int4pack
   8-bit: unpack (standard order) → subtract 128 → int8 direct use
 
-Architecture (Pattern A):
+Architecture (Ascend Scheme 框架):
   Linear schemes use autonomous weight registration via ``get_weight()`` /
   ``get_pergroup_param()``. GPTQ's qweight is packed along dim=0 while qzeros
   is packed along dim=1, so they must go in different ``get_*()`` methods.
@@ -301,7 +301,7 @@ def _apply_gptq_linear(
 
 @register_scheme("W4A16_GPTQ", "linear")
 class AscendW4A16GPTQLinearScheme(AscendLinearScheme):
-    """Linear scheme for Ascend W4A16 GPTQ quantization (4-bit, Pattern A).
+    """Linear scheme for Ascend W4A16 GPTQ quantization (4-bit, Ascend Scheme 框架).
 
     Uses autonomous weight registration. GPTQ packs weights along dim=0
     (input dimension) with standard sequential bit order. qweight is packed
@@ -346,7 +346,7 @@ class AscendW4A16GPTQLinearScheme(AscendLinearScheme):
 
 @register_scheme("W8A16_GPTQ", "linear")
 class AscendW8A16GPTQLinearScheme(AscendLinearScheme):
-    """Linear scheme for Ascend W8A16 GPTQ quantization (8-bit, Pattern A).
+    """Linear scheme for Ascend W8A16 GPTQ quantization (8-bit, Ascend Scheme 框架).
 
     8-bit GPTQ uses int8 weights directly without additional repacking.
     Same structure as 4-bit but with pack_factor=4.
