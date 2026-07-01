@@ -194,6 +194,13 @@ class AscendW8A16TorchAOLinearScheme(AscendLinearScheme):
             # the checkpoint. Just place on device + set up the (symmetric,
             # per-channel) NPU-op params — no quantization step.
             out_dtype = layer.scales.dtype
+            # int8wo is per-channel: scales must be 1-D [N]. Guard so a future
+            # per-group variant fails loudly here rather than mis-sizing output.
+            if layer.scales.ndim != 1:
+                raise ValueError(
+                    "torchao int8 pre-quantized checkpoint expects per-channel "
+                    f"scales of shape [N] (ndim==1), got ndim={layer.scales.ndim}."
+                )
             output_size = layer.scales.shape[0]
             device = layer.qweight.device
             layer.qweight = torch.nn.Parameter(layer.qweight.data.to(device), requires_grad=False)

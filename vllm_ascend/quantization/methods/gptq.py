@@ -214,18 +214,29 @@ def _process_gptq_weights_after_loading(
     layer.gptq_output_size = layer.qweight.data.shape[-1]
 
     # --- desc_act handling ---
-    if desc_act and hasattr(layer, "g_idx"):
-        # Sort g_idx to get the permutation that orders weights by group
-        g_idx = layer.g_idx.data
-        perm = torch.argsort(g_idx).to(torch.int32)
+    # desc_act checkpoints store the weight in PERMUTED input order (columns
+    # reordered by Hessian importance), with g_idx[i] = the original input
+    # feature now at permuted position i. Per-group scales/qzeros are in the
+    # SAME permuted order. Un-permuting the weight would break that alignment
+    # (the permutation does not preserve group boundaries), so we KEEP the
+    # weight permuted and instead gather the ACTIVATION by g_idx at runtime
+    # (see _apply_gptq_linear): x_perm[:, i] = x[:, g_idx[i]] recovers the
+    # correct feature<->weight pairing. (TP=1 only; TP>1 + desc_act is not
+    # supported, matching the MoE desc_act rejection.)
+    if desc_act and hasattr(layer, "g_idx") and layer.g_idx.numel() > 0:
+        # g_idx[i] = quantization group of input feature i (values are group
+        # indices 0..num_groups-1, NOT a feature permutation). argsort(g_idx)
+        # group-sorts the weight so consecutive G columns form one group — this
+        # matches both the NPU op's per-group dequant and the stored scales
+        # (which are already in group order). The activation is gathered by the
+        # SAME perm at runtime (_apply_gptq_linear): x[perm] @ W[perm] == x @ W
+        # because the contracted dim is consistently reordered. (Equivalent to
+        # upstream's argsort(g_idx) + gptq_shuffle + kernel-time activation
+        # gather, minus the exllama bit-interleave which our int4pack replaces.)
+        perm = torch.argsort(layer.g_idx.data).to(torch.int64)
         layer.g_idx = torch.nn.Parameter(perm, requires_grad=False)
-
-        # Unpack first, then shuffle by permutation, then repack later.
-        # qweight shape: (K // pack_factor, N) — pack along dim=0
-        unpacked_qweight = _unpack_qweight_from_int32(layer.qweight.data, weight_bits)
-        # Apply permutation to the unpacked weight (dim=0 is the input dim)
-        unpacked_qweight = unpacked_qweight[perm]
-        layer.qweight.data = unpacked_qweight
+        unpacked = _unpack_qweight_from_int32(layer.qweight.data, weight_bits)
+        layer.qweight.data = unpacked[perm]
     else:
         # No desc_act — just unpack
         layer.qweight.data = _unpack_qweight_from_int32(layer.qweight.data, weight_bits)
@@ -283,6 +294,10 @@ def _apply_gptq_linear(
         bias = bias.float()
 
     reshaped_x = x.reshape(-1, x.shape[-1])
+    # desc_act: weight is stored in permuted input order; gather x's input dim
+    # by g_idx so features pair with the permuted weight columns.
+    if hasattr(layer, "g_idx") and layer.g_idx.numel() > 0:
+        reshaped_x = reshaped_x[:, layer.g_idx]
 
     out = torch_npu.npu_weight_quant_batchmatmul(
         reshaped_x,
@@ -511,7 +526,14 @@ def _repack_gptq_moe_qweight(
             qweight_data.shape[1] * pack_factor,
             -1,
         )
-    # 8-bit: keep int8, view as int32 for grouped_matmul storage.
+    # 8-bit: keep int8, view 4 consecutive int8 as one int32 for grouped_matmul
+    # storage. Requires the output dim divisible by 4 (pack_factor for 8-bit);
+    # the weight spec enforces this, but guard for a clearer error if bypassed.
+    if unpacked.shape[-1] % 4 != 0:
+        raise ValueError(
+            "8-bit GPTQ MoE expects the output dim divisible by 4 to reinterpret "
+            f"int8 as int32 storage, got last-dim size {unpacked.shape[-1]}."
+        )
     return unpacked.contiguous().view(torch.int32)
 
 

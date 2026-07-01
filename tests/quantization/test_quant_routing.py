@@ -856,6 +856,18 @@ class TestTorchAORouting:
         with pytest.raises(NotImplementedError, match="autoquant"):
             TorchAOConfig.from_config({"quant_type": {"default": {"name": "AutoQuantization"}}})
 
+    def test_moe_raises_not_implemented(self):
+        # torchao MoE expert quantization is out of MVP scope; a FusedMoE layer
+        # must raise (not silently fall back to dense experts), mirroring GGUF.
+        import pytest
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig.from_config({"quant_method": "torchao", "quant_type": {"default": "int8wo"}})
+        with pytest.raises(NotImplementedError, match="MoE"):
+            cfg.get_quant_method(MagicMock(spec=FusedMoE), prefix="moe")
+
 
 # ---------------------------------------------------------------------------
 # gguf: config override + Linear routing (Pattern A, dedicated method)
@@ -907,7 +919,6 @@ class TestGGUFRouting:
         cfg = GGUFConfig.from_config({})
         with pytest.raises(NotImplementedError, match="MoE"):
             cfg.get_quant_method(MagicMock(spec=FusedMoE), prefix="moe")
-
 
 
 if __name__ == "__main__":
