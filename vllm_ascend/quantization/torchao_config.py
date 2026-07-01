@@ -18,7 +18,7 @@
 """torchao quantization config for Ascend NPU.
 
 This config replaces vLLM's native ``TorchAOConfig`` so that
-``--quantization torchao`` is routed through Ascend NPU operators (Pattern A):
+``--quantization torchao`` is routed through Ascend NPU operators (Ascend Scheme 框架):
 
 - **Linear layers** → ``AscendW4A16TorchAOLinearScheme`` /
   ``AscendW8A16TorchAOLinearScheme`` (registered via ``@register_scheme``,
@@ -34,7 +34,7 @@ int4wo is *self-implemented* (per-group symmetric int4 RTN) because torchao 0.17
 standard int4 path requires ``mslk`` (a CUDA/H100-only kernel) unavailable on NPU;
 its numerics match torchao int4wo and are validated against ``.dequantize()``.
 
-Why override the native config (same Pattern A as AWQ/GPTQ): torchao is an external
+Why override the native config (same Ascend Scheme 框架 as AWQ/GPTQ): torchao is an external
 PyTorch library whose native vLLM path delegates quant+matmul to the torchao
 library's CUDA kernels (tinygemm/mslk). On NPU those kernels are unavailable, and
 the native config is a thin shell with nothing NPU-adjustable inside it — so
@@ -44,8 +44,16 @@ Scope: int8wo/fp8wo/int4wo are *online* quantization of a dense checkpoint. Load
 a *pre-quantized* torchao int4 checkpoint is **out of MVP scope** (T-10): its packed
 serialization format is not yet handled. int8/fp8 pre-quantized checkpoints are
 tractable via torchao ``unflatten_tensor_state_dict``.
+
+Per-layer overrides (T-12): ``module_fqn_to_config`` (under
+``quant_type._data``) maps specific layer fqns — or ``re:`` regex patterns, with a
+``_default`` fallback — to different quant types; ``None``/unmatched layers stay
+dense, mirroring upstream ``ModuleFqnToConfig``. ``autoquant`` is rejected up front
+(it needs runtime CUDA-kernel benchmarking, unavailable on NPU).
 """
 
+import copy
+import re
 from typing import Any
 
 import torch
@@ -71,6 +79,10 @@ _TORCHAO_SCHEME_KEY = {
 
 _DEFAULT_TORCHAO_GROUP_SIZE = 128
 
+# Sentinel for "no ``_default`` key in module_fqn_to_config" (distinct from an
+# explicit ``None`` entry, which also means dense).
+_UNSET: Any = object()
+
 
 @register_quantization_config(TORCHAO_QUANTIZATION_METHOD)
 class TorchAOConfig(QuantizationConfig):
@@ -88,6 +100,7 @@ class TorchAOConfig(QuantizationConfig):
         is_checkpoint_torchao_serialized: bool = False,
         is_prequant_checkpoint: bool = False,
         modules_to_not_convert: list[str] | None = None,
+        module_fqn_to_config: dict[str, Any] | None = None,
         quant_config: dict[str, Any] | None = None,
     ):
         self.quant_description = quant_config if quant_config is not None else {}
@@ -102,6 +115,12 @@ class TorchAOConfig(QuantizationConfig):
         # AQTensor loader). Read from the checkpoint's quantization_config.
         self.is_prequant_checkpoint = is_prequant_checkpoint
         self.modules_to_not_convert = modules_to_not_convert or []
+        # Per-layer override map (T-12): ``{fqn_or_regex: torchao_cfg_dict | None}``.
+        # Mirrors upstream ``ModuleFqnToConfig``: an entry value of ``None`` (or an
+        # unmatched layer when no ``_default`` key is present) leaves that layer
+        # dense. Resolution order in ``get_quant_method``: exact fqn → first
+        # ``re:``-prefixed regex full-match → ``_default`` → global default.
+        self.module_fqn_to_config: dict[str, Any] = module_fqn_to_config or {}
 
         if torchao_quant_type not in _TORCHAO_SCHEME_KEY:
             raise ValueError(
@@ -166,12 +185,18 @@ class TorchAOConfig(QuantizationConfig):
         torchao_quant_type, group_size = _parse_torchao_quant_type(quant_type)
 
         modules_to_not_convert = config.get("modules_to_not_convert", []) or []
+        # Per-layer overrides live inside the torchao quant_type payload, under
+        # ``_data.module_fqn_to_config`` (the same place upstream's
+        # ``config_from_dict`` sources ``ModuleFqnToConfig``).
+        _data = quant_type.get("_data", {}) if isinstance(quant_type, dict) else {}
+        module_fqn_to_config = _data.get("module_fqn_to_config", {}) if isinstance(_data, dict) else {}
         return cls(
             torchao_quant_type,
             group_size=group_size,
             is_checkpoint_torchao_serialized=is_checkpoint_torchao_serialized,
             is_prequant_checkpoint=is_prequant_checkpoint,
             modules_to_not_convert=list(modules_to_not_convert),
+            module_fqn_to_config=dict(module_fqn_to_config),
             quant_config=config,
         )
 
@@ -181,11 +206,53 @@ class TorchAOConfig(QuantizationConfig):
         if _is_layer_skipped(prefix, self.modules_to_not_convert):
             return AscendUnquantizedLinearMethod()
 
-        scheme_key = _TORCHAO_SCHEME_KEY[self.torchao_quant_type]
+        resolved = self._resolve_fqn(prefix)
+        if resolved is None:
+            # Per-layer override says dense: explicit ``None`` entry, or an
+            # unmatched layer with no ``_default`` (mirrors upstream's
+            # ``UnquantizedLinearMethod`` fallback inside ModuleFqnToConfig).
+            return AscendUnquantizedLinearMethod()
+
+        torchao_quant_type, group_size = resolved
+        scheme_key = _TORCHAO_SCHEME_KEY[torchao_quant_type]
         scheme_cls = get_scheme_class(scheme_key, "linear")
         if scheme_cls is None:
             raise NotImplementedError(f"{scheme_key} linear scheme not registered for layer {prefix}")
+        # Schemes read only ``quant_config.group_size``; when a per-layer
+        # override changes it, build the scheme against a shallow copy carrying
+        # the resolved value (mirrors upstream's per-layer TorchAOConfig).
+        if group_size != self.group_size or torchao_quant_type != self.torchao_quant_type:
+            per_layer = copy.copy(self)
+            per_layer.torchao_quant_type = torchao_quant_type
+            per_layer.group_size = group_size
+            return AscendLinearMethod(scheme_cls(per_layer))
         return AscendLinearMethod(scheme_cls(self))
+
+    def _resolve_fqn(self, prefix: str) -> tuple[str, int] | None:
+        """Resolve ``(quant_type, group_size)`` for ``prefix``.
+
+        Returns ``None`` when the layer should stay dense: an explicit ``None``
+        entry in ``module_fqn_to_config``, or an unmatched layer when no
+        ``_default`` key is present. When ``module_fqn_to_config`` is empty the
+        global default applies to every layer.
+        """
+        m = self.module_fqn_to_config
+        if not m:
+            return self.torchao_quant_type, self.group_size
+
+        if prefix in m:
+            cfg = m[prefix]
+        else:
+            for pattern, value in m.items():
+                if pattern.startswith("re:") and re.fullmatch(pattern[3:], prefix):
+                    cfg = value
+                    break
+            else:
+                cfg = m.get("_default", _UNSET)
+
+        if cfg is _UNSET or cfg is None:
+            return None
+        return _parse_torchao_quant_type(cfg)
 
 
 def _parse_torchao_quant_type(quant_type: Any) -> tuple[str, int]:
@@ -209,6 +276,17 @@ def _parse_torchao_quant_type(quant_type: Any) -> tuple[str, int]:
     if isinstance(quant_type, dict):
         name = str(quant_type.get("name") or quant_type.get("_type") or "").lower()
         group_size = int(quant_type.get("group_size", _DEFAULT_TORCHAO_GROUP_SIZE))
+        if "autoquant" in name or "auto_quant" in name:
+            # torchao autoquant benchmarks candidate configs against CUDA kernels
+            # at runtime; it has no NPU equivalent and cannot map to the fixed
+            # int4/int8/fp8 Ascend schemes. Reject up front with a clear message
+            # (consistent with the GPTQ 2/3-bit前置拒绝, T15).
+            raise NotImplementedError(
+                "torchao 'autoquant' is not supported on Ascend NPU: it requires "
+                "runtime CUDA-kernel benchmarking. Use an explicit quant_type "
+                "('int4wo'/'int8wo'/'fp8wo'), optionally per-layer via "
+                "module_fqn_to_config."
+            )
         if "int4" in name:
             return "int4wo", group_size
         if "int8" in name:

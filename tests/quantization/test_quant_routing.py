@@ -597,6 +597,91 @@ class TestTorchAORouting:
         cfg = TorchAOConfig.from_config({"quant_type": {"default": "int8wo"}})
         assert cfg.get_quant_method(MagicMock(), prefix="foo") is None
 
+    # -- T-12: per-layer module_fqn_to_config overrides + autoquant rejection --
+
+    def test_module_fqn_exact_override(self):
+        # Default int8, but one named layer forced to int4-g64.
+        from vllm_ascend.quantization.methods.torchao import (
+            AscendW4A16TorchAOLinearScheme,
+        )
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig(
+            "int8wo",
+            module_fqn_to_config={"model.layers.0.mlp.gate_proj": {"name": "int4", "group_size": 64}},
+        )
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.mlp.gate_proj")
+        assert isinstance(method.quant_method, AscendW4A16TorchAOLinearScheme)
+        # Per-layer group_size reaches the scheme.
+        assert method.quant_method.group_size == 64
+
+    def test_module_fqn_regex_override(self):
+        from vllm_ascend.quantization.methods.torchao import (
+            AscendW4A16TorchAOLinearScheme,
+        )
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig(
+            "int8wo",
+            module_fqn_to_config={"re:.*\\.gate_proj$": {"name": "int4"}},
+        )
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.5.mlp.gate_proj")
+        assert isinstance(method.quant_method, AscendW4A16TorchAOLinearScheme)
+
+    def test_module_fqn_default_fallback(self):
+        # _default applies to layers that match no entry.
+        from vllm_ascend.quantization.methods.torchao import (
+            AscendW4A16TorchAOLinearScheme,
+            AscendW8A16TorchAOLinearScheme,
+        )
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig(
+            "int8wo",
+            module_fqn_to_config={"_default": {"name": "int4"}, "re:.*lm_head$": {"name": "int8"}},
+        )
+        head = cfg.get_quant_method(self._linear_layer(), prefix="model.lm_head")
+        other = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
+        assert isinstance(head.quant_method, AscendW8A16TorchAOLinearScheme)
+        assert isinstance(other.quant_method, AscendW4A16TorchAOLinearScheme)  # _default
+
+    def test_module_fqn_explicit_none_is_dense(self):
+        from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig("int8wo", module_fqn_to_config={"lm_head": None})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="lm_head")
+        assert isinstance(method, AscendUnquantizedLinearMethod)
+
+    def test_module_fqn_unmatched_no_default_is_dense(self):
+        # No _default → unmatched layers stay dense (mirrors upstream
+        # UnquantizedLinearMethod fallback inside ModuleFqnToConfig).
+        from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig("int8wo", module_fqn_to_config={"re:.*gate_proj$": {"name": "int4"}})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
+        assert isinstance(method, AscendUnquantizedLinearMethod)
+
+    def test_module_fqn_parsed_from_data(self):
+        # from_config pulls module_fqn_to_config out of quant_type._data.
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig.from_config(
+            {
+                "quant_type": {
+                    "default": {"name": "Int8WeightOnlyConfig", "_data": {"module_fqn_to_config": {"lm_head": None}}},
+                }
+            }
+        )
+        assert cfg.module_fqn_to_config == {"lm_head": None}
+
+    def test_autoquant_rejected(self):
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        with pytest.raises(NotImplementedError, match="autoquant"):
+            TorchAOConfig.from_config({"quant_type": {"default": {"name": "AutoQuantization"}}})
+
 
 # ---------------------------------------------------------------------------
 # gguf: config override + Linear routing (Pattern A, dedicated method)
