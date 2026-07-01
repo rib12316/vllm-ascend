@@ -20,7 +20,7 @@ MUST run from /data/ascend/vllm-ascend/ (CWD namespace conflict). Save stdout:
     cd /data/ascend/vllm-ascend
     source /data/ascend/.venv/bin/activate
     python benchmarks/benchmark_torchao_gguf.py --label torchao_gguf \
-      2>&1 | tee /data/ascend/logs/2026-06-17_N1_bench_torchao_gguf.log
+      2>&1 | tee /data/ascend/logs/bench/2026-06-17_torchao-gguf-bench.log
 """
 
 import argparse
