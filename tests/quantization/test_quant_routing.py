@@ -649,5 +649,266 @@ class TestGPTQDynamicOverride:
             cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
 
 
+# ---------------------------------------------------------------------------
+# torchao: config parsing + Linear routing (Pattern A)
+# ---------------------------------------------------------------------------
+
+
+class TestTorchAORouting:
+    """torchao config parsing and Linear layer routing.
+
+    Verifies that ``--quantization torchao`` (overriding vLLM's native config)
+    parses int4wo/int8wo/fp8wo and routes LinearBase layers to the Ascend
+    scheme via AscendLinearMethod, while skipped layers fall back to the
+    unquantized method. Pure Python, no NPU dependency.
+    """
+
+    def _linear_layer(self):
+        from vllm.model_executor.layers.linear import LinearBase
+
+        return MagicMock(spec=LinearBase)
+
+    def test_from_config_int8wo(self):
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig.from_config({"quant_method": "torchao", "quant_type": {"default": "int8wo"}})
+        assert cfg.torchao_quant_type == "int8wo"
+        # Online quant of a dense checkpoint → not torchao-serialized.
+        assert cfg.is_checkpoint_torchao_serialized is False
+
+    def test_from_config_prequant_serialized_opt_in(self):
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        # A torchao-serialized (pre-quant) checkpoint must opt in explicitly.
+        cfg = TorchAOConfig.from_config(
+            {"quant_method": "torchao", "quant_type": {"default": "int8wo"}, "is_checkpoint_torchao_serialized": True}
+        )
+        assert cfg.is_checkpoint_torchao_serialized is True
+
+    def test_from_config_prequant_flat_flag(self):
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        # T-10: a flat-tensor pre-quantized checkpoint opts in via "prequant":
+        # true (distinct from is_checkpoint_torchao_serialized, which would
+        # trigger vLLM's native torchao AQTensor loader). Default is False.
+        cfg_off = TorchAOConfig.from_config({"quant_method": "torchao", "quant_type": {"default": "int8wo"}})
+        assert cfg_off.is_prequant_checkpoint is False
+        cfg_on = TorchAOConfig.from_config(
+            {"quant_method": "torchao", "quant_type": {"default": "int8wo"}, "prequant": True}
+        )
+        assert cfg_on.is_prequant_checkpoint is True
+        # pre-quant flat path keeps the native torchao loader OFF
+        assert cfg_on.is_checkpoint_torchao_serialized is False
+
+    def test_from_config_int4wo_with_group_size(self):
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig.from_config({"quant_type": {"default": "int4wo-g64"}})
+        assert cfg.torchao_quant_type == "int4wo"
+        assert cfg.group_size == 64
+
+    def test_from_config_dict_form(self):
+        # The serialized AOBaseConfig dict form (name + group_size) is also accepted.
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig.from_config(
+            {"quant_type": {"default": {"name": "Int8WeightOnlyConfig", "group_size": 128}}}
+        )
+        assert cfg.torchao_quant_type == "int8wo"
+        assert cfg.group_size == 128
+
+    def test_unsupported_type_rejected(self):
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        with pytest.raises(ValueError, match="Unsupported"):
+            TorchAOConfig.from_config({"quant_type": {"default": "int2wo"}})
+
+    def test_missing_quant_type_rejected(self):
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        with pytest.raises(ValueError, match="quant_type"):
+            TorchAOConfig.from_config({"quant_method": "torchao"})
+
+    def test_group_size_zero_rejected(self):
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        with pytest.raises(ValueError, match="positive"):
+            TorchAOConfig(torchao_quant_type="int8wo", group_size=0)
+
+    def test_int8_routes_to_ascend_linear_method(self):
+        from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+        from vllm_ascend.quantization.methods.torchao import (
+            AscendW8A16TorchAOLinearScheme,
+        )
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig.from_config({"quant_method": "torchao", "quant_type": {"default": "int8wo"}})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
+        assert isinstance(method, AscendLinearMethod)
+        assert isinstance(method.quant_method, AscendW8A16TorchAOLinearScheme)
+
+    def test_int4_routes_to_w4_scheme(self):
+        from vllm_ascend.quantization.methods.torchao import (
+            AscendW4A16TorchAOLinearScheme,
+        )
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig.from_config({"quant_type": {"default": "int4wo"}})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.mlp.gate_proj")
+        assert isinstance(method.quant_method, AscendW4A16TorchAOLinearScheme)
+
+    def test_skipped_layer_routes_unquantized(self):
+        from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig.from_config({"quant_type": {"default": "int8wo"}, "modules_to_not_convert": ["lm_head"]})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="lm_head")
+        assert isinstance(method, AscendUnquantizedLinearMethod)
+
+    def test_non_linear_returns_none(self):
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig.from_config({"quant_type": {"default": "int8wo"}})
+        assert cfg.get_quant_method(MagicMock(), prefix="foo") is None
+
+    # -- T-12: per-layer module_fqn_to_config overrides + autoquant rejection --
+
+    def test_module_fqn_exact_override(self):
+        # Default int8, but one named layer forced to int4-g64.
+        from vllm_ascend.quantization.methods.torchao import (
+            AscendW4A16TorchAOLinearScheme,
+        )
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig(
+            "int8wo",
+            module_fqn_to_config={"model.layers.0.mlp.gate_proj": {"name": "int4", "group_size": 64}},
+        )
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.mlp.gate_proj")
+        assert isinstance(method.quant_method, AscendW4A16TorchAOLinearScheme)
+        # Per-layer group_size reaches the scheme.
+        assert method.quant_method.group_size == 64
+
+    def test_module_fqn_regex_override(self):
+        from vllm_ascend.quantization.methods.torchao import (
+            AscendW4A16TorchAOLinearScheme,
+        )
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig(
+            "int8wo",
+            module_fqn_to_config={"re:.*\\.gate_proj$": {"name": "int4"}},
+        )
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.5.mlp.gate_proj")
+        assert isinstance(method.quant_method, AscendW4A16TorchAOLinearScheme)
+
+    def test_module_fqn_default_fallback(self):
+        # _default applies to layers that match no entry.
+        from vllm_ascend.quantization.methods.torchao import (
+            AscendW4A16TorchAOLinearScheme,
+            AscendW8A16TorchAOLinearScheme,
+        )
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig(
+            "int8wo",
+            module_fqn_to_config={"_default": {"name": "int4"}, "re:.*lm_head$": {"name": "int8"}},
+        )
+        head = cfg.get_quant_method(self._linear_layer(), prefix="model.lm_head")
+        other = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
+        assert isinstance(head.quant_method, AscendW8A16TorchAOLinearScheme)
+        assert isinstance(other.quant_method, AscendW4A16TorchAOLinearScheme)  # _default
+
+    def test_module_fqn_explicit_none_is_dense(self):
+        from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig("int8wo", module_fqn_to_config={"lm_head": None})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="lm_head")
+        assert isinstance(method, AscendUnquantizedLinearMethod)
+
+    def test_module_fqn_unmatched_no_default_is_dense(self):
+        # No _default → unmatched layers stay dense (mirrors upstream
+        # UnquantizedLinearMethod fallback inside ModuleFqnToConfig).
+        from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig("int8wo", module_fqn_to_config={"re:.*gate_proj$": {"name": "int4"}})
+        method = cfg.get_quant_method(self._linear_layer(), prefix="model.layers.0.self_attn.q_proj")
+        assert isinstance(method, AscendUnquantizedLinearMethod)
+
+    def test_module_fqn_parsed_from_data(self):
+        # from_config pulls module_fqn_to_config out of quant_type._data.
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        cfg = TorchAOConfig.from_config(
+            {
+                "quant_type": {
+                    "default": {"name": "Int8WeightOnlyConfig", "_data": {"module_fqn_to_config": {"lm_head": None}}},
+                }
+            }
+        )
+        assert cfg.module_fqn_to_config == {"lm_head": None}
+
+    def test_autoquant_rejected(self):
+        from vllm_ascend.quantization.torchao_config import TorchAOConfig
+
+        with pytest.raises(NotImplementedError, match="autoquant"):
+            TorchAOConfig.from_config({"quant_type": {"default": {"name": "AutoQuantization"}}})
+
+
+# ---------------------------------------------------------------------------
+# gguf: config override + Linear routing (Pattern A, dedicated method)
+# ---------------------------------------------------------------------------
+
+
+class TestGGUFRouting:
+    """gguf config override and routing.
+
+    GGUF uses the ``is_gguf_weight`` loader contract (distinct from the
+    packed-param AWQ/GPTQ pattern), so it routes to a dedicated
+    ``AscendGGUFLinearMethod`` rather than the ``AscendLinearScheme`` registry.
+    """
+
+    def test_from_config_and_name(self):
+        from vllm_ascend.quantization.gguf_config import GGUFConfig
+
+        cfg = GGUFConfig.from_config({})
+        assert cfg.get_name() == "gguf"
+
+    def test_override_when_user_requests_gguf(self):
+        from vllm_ascend.quantization.gguf_config import GGUFConfig
+
+        assert GGUFConfig.override_quantization_method({}, "gguf") == "gguf"
+        assert GGUFConfig.override_quantization_method({}, "fp8") is None
+
+    def test_linear_routes_to_gguf_method(self):
+        from vllm.model_executor.layers.linear import LinearBase
+
+        from vllm_ascend.quantization.gguf_config import GGUFConfig
+        from vllm_ascend.quantization.methods.gguf import AscendGGUFLinearMethod
+
+        cfg = GGUFConfig.from_config({})
+        method = cfg.get_quant_method(MagicMock(spec=LinearBase), prefix="model.layers.0.self_attn.o_proj")
+        assert isinstance(method, AscendGGUFLinearMethod)
+
+    def test_non_linear_returns_none(self):
+        from vllm_ascend.quantization.gguf_config import GGUFConfig
+
+        cfg = GGUFConfig.from_config({})
+        assert cfg.get_quant_method(MagicMock(), prefix="foo") is None
+
+    def test_moe_raises_not_implemented(self):
+        import pytest
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+
+        from vllm_ascend.quantization.gguf_config import GGUFConfig
+
+        cfg = GGUFConfig.from_config({})
+        with pytest.raises(NotImplementedError, match="MoE"):
+            cfg.get_quant_method(MagicMock(spec=FusedMoE), prefix="moe")
+
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
