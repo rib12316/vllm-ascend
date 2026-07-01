@@ -46,7 +46,7 @@ from .gguf_repack import GGUF_NPU_REPACK_TYPES, repack_to_npu
 
 
 class AscendGGUFLinearMethod(LinearMethodBase):
-    """GGUF linear method that dequantizes to dense at load time (Pattern A).
+    """GGUF linear method that dequantizes to dense at load time (Ascend Scheme 框架).
 
     Args:
         quant_config: The Ascend GGUF config (currently carries no parameters;

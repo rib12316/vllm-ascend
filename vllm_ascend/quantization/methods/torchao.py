@@ -18,7 +18,7 @@
 """Ascend torchao quantization schemes for Linear layers.
 
 torchao is used **only at load time** to produce integer weight tensors; the
-forward pass runs ``npu_weight_quant_batchmatmul`` (Pattern A, same operator as
+forward pass runs ``npu_weight_quant_batchmatmul`` (Ascend Scheme 框架, same operator as
 AWQ/GPTQ). torchao is never on the inference hot path.
 
 Supported quant types:
@@ -152,7 +152,7 @@ def _quantize_dense_int4_symmetric(
 
 @register_scheme("W8A16_TORCHAO", "linear")
 class AscendW8A16TorchAOLinearScheme(AscendLinearScheme):
-    """Linear scheme for torchao int8wo (per-channel symmetric int8, Pattern A).
+    """Linear scheme for torchao int8wo (per-channel symmetric int8, Ascend Scheme 框架).
 
     The dense weight is loaded from the checkpoint (online quantization), then
     quantized with torchao ``Int8WeightOnlyConfig`` at load time. Forward runs
