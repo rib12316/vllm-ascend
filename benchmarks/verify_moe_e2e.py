@@ -10,7 +10,7 @@
 """End-to-end MoE verification for AWQ / GPTQ quantization on Ascend NPU.
 
 This is the MoE counterpart of the linear-model smoke test that verified
-T1/T2/T6 (see logs/2026-06-12_T1T2T6_inference_verification.log). The MoE
+T1/T2/T6 (see logs/e2e/2026-06-12_awq-gptq-inference.log). The MoE
 weight-processing math is covered by tests/quantization/test_moe_synthetic_npu.py,
 but that test explicitly skips the full ``apply -> fused_experts -> grouped_matmul``
 path and real-checkpoint loading. This script closes that gap: it loads the two
@@ -25,7 +25,7 @@ mirroring the subprocess-per-model design in ``benchmark_awq_gptq.py``.
 
 Run from the vllm-ascend/ directory with the venv active:
 
-    python benchmarks/verify_moe_e2e.py 2>&1 | tee logs/<date>_T3T4_moe-e2e.log
+    python benchmarks/verify_moe_e2e.py 2>&1 | tee logs/e2e/<date>_moe-e2e.log
 """
 
 import json

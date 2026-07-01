@@ -19,7 +19,7 @@ Save full stdout to logs:
     cd /data/ascend/vllm-ascend
     source /data/ascend/.venv/bin/activate
     python benchmarks/benchmark_awq_gptq.py --label baseline \\
-      2>&1 | tee /data/ascend/logs/2026-06-12_bench_dense_vs_quant_qwen0.5b.log
+      2>&1 | tee /data/ascend/logs/bench/2026-06-12_awq-gptq-bench-diverse.log
 """
 
 import argparse

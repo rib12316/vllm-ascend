@@ -20,7 +20,7 @@ accuracy is sane, NOT the quantized-vs-dense delta.
 
 Usage (from vllm-ascend/ with venv + set_env + custom-op env):
     python benchmarks/eval_moe_accuracy.py --limit 500 2>&1 \\
-        | tee logs/<date>_R1_moe-accuracy.log
+        | tee logs/accuracy/<date>_moe-accuracy.log
 """
 
 import argparse

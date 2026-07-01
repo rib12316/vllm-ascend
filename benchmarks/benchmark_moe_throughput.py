@@ -25,7 +25,7 @@ Usage:
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
     export ASCEND_CUSTOM_OPP_PATH=$PWD/vllm_ascend/_cann_ops_custom/vendors/custom_transformer
     export LD_LIBRARY_PATH=$ASCEND_CUSTOM_OPP_PATH/op_api/lib:$PWD/vllm_ascend:$LD_LIBRARY_PATH
-    python benchmarks/benchmark_moe_throughput.py 2>&1 | tee logs/<date>_R1_moe-throughput.log
+    python benchmarks/benchmark_moe_throughput.py 2>&1 | tee logs/bench/<date>_moe-throughput.log
 """
 
 import argparse
