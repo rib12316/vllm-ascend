@@ -43,9 +43,8 @@ def _to_int32_tensor(val):
     exceeds the signed int32 range. We use struct.pack('I', ...) to handle
     the unsigned→signed conversion correctly.
     """
-    return torch.frombuffer(
-        struct.pack('I', val & 0xFFFFFFFF), dtype=torch.int32
-    ).reshape(())
+    return torch.frombuffer(struct.pack("I", val & 0xFFFFFFFF), dtype=torch.int32).reshape(())
+
 
 # ---------------------------------------------------------------------------
 # AWQ weight unpacking tests
@@ -58,10 +57,11 @@ class TestAWQWeightUnpack:
     def setup_method(self):
         """Import AWQ functions dynamically (avoids torch_npu import on non-NPU)."""
         from vllm_ascend.quantization.methods.w4a16_awq import (
+            REVERSE_AWQ_PACK_ORDER,
             _unpack_qzero_from_int32,
             _unpack_weight_from_int32,
-            REVERSE_AWQ_PACK_ORDER,
         )
+
         self.unpack_qzero = _unpack_qzero_from_int32
         self.unpack_weight = _unpack_weight_from_int32
         self.pack_order = REVERSE_AWQ_PACK_ORDER
@@ -179,6 +179,7 @@ class TestGPTQWeightUnpack:
             _unpack_qweight_from_int32,
             _unpack_qzeros_from_int32,
         )
+
         self.unpack_qweight = _unpack_qweight_from_int32
         self.unpack_qzeros = _unpack_qzeros_from_int32
 
@@ -188,7 +189,6 @@ class TestGPTQWeightUnpack:
         GPTQ packs along dim=0: row i of the packed tensor contains values
         at positions [i, i+pack_factor, i+2*pack_factor, ...].
         """
-        pack_factor = 32 // num_bits
         result = 0
         for i, val in enumerate(values_4bit):
             result |= (val & ((1 << num_bits) - 1)) << (num_bits * i)
@@ -299,9 +299,7 @@ class TestGPTQWeightUnpack:
         pack_factor = 8  # 4-bit
 
         # Create random packed weights
-        weight_packed = torch.randint(
-            0, 2**31 - 1, (K // pack_factor, N), dtype=torch.int32
-        )
+        weight_packed = torch.randint(0, 2**31 - 1, (K // pack_factor, N), dtype=torch.int32)
         result = self.unpack_qweight(weight_packed, num_bits=4)
 
         assert result.shape == (K, N), f"Expected ({K}, {N}), got {result.shape}"
@@ -479,9 +477,71 @@ class TestGPTQConfig:
         # The method should not exist on GPTQConfig itself
         assert "override_quantization_method" not in GPTQConfig.__dict__
         # Inherited from parent QuantizationConfig, returns None by default
-        result = GPTQConfig.override_quantization_method(
-            {"quant_method": "gptq"}, "gptq")
+        result = GPTQConfig.override_quantization_method({"quant_method": "gptq"}, "gptq")
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# GPTQ Linear desc_act TP>1 guard (Bug#17 follow-up)
+# ---------------------------------------------------------------------------
+
+
+class TestGPTQLinearDescActTPGuard:
+    """GPTQ Linear ``desc_act=True`` with ``tensor_parallel_size>1`` must raise.
+
+    On row-parallel layers (down_proj / o_proj) the input dim is sharded across
+    TP ranks, so the runtime activation gather ``x[perm]`` (perm = argsort of
+    the local shard's g_idx) would reorder a sharded activation inconsistently
+    and silently corrupt output. The Linear path must fail loud — mirroring the
+    MoE desc_act rejection (see ``test_moe_synthetic_npu.py``) and the
+    documented "TP=1 only" constraint.
+    """
+
+    def test_desc_act_rejects_tp_gt_1(self, monkeypatch):
+        import vllm.distributed as vllm_dist
+
+        from vllm_ascend.quantization.methods.gptq import (
+            _process_gptq_weights_after_loading,
+        )
+
+        # TP group is normally only initialized inside a running vLLM engine;
+        # patch the accessors the guard reads at call time.
+        monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(vllm_dist, "model_parallel_is_initialized", lambda: True)
+
+        layer = torch.nn.Module()
+        layer.qweight = torch.nn.Parameter(torch.zeros((32, 64), dtype=torch.int32), requires_grad=False)
+        layer.g_idx = torch.nn.Parameter(torch.arange(256, dtype=torch.int32), requires_grad=False)
+
+        with pytest.raises(NotImplementedError, match="tensor_parallel_size>1"):
+            _process_gptq_weights_after_loading(layer, weight_bits=4, desc_act=True, use_v2_format=False)
+
+    def test_desc_act_passes_guard_when_tp1(self, monkeypatch):
+        """TP=1 must NOT raise the TP guard (it proceeds to real processing)."""
+        import vllm.distributed as vllm_dist
+
+        from vllm_ascend.quantization.methods.gptq import (
+            _process_gptq_weights_after_loading,
+        )
+
+        monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(vllm_dist, "model_parallel_is_initialized", lambda: True)
+
+        layer = torch.nn.Module()
+        layer.qweight = torch.nn.Parameter(torch.zeros((32, 64), dtype=torch.int32), requires_grad=False)
+        layer.g_idx = torch.nn.Parameter(torch.arange(256, dtype=torch.int32), requires_grad=False)
+
+        # TP=1 passes the guard, then proceeds into unpack/repack which calls
+        # NPU ops needing a device — so we only assert the TP guard itself did
+        # not fire. Any other exception means the guard passed.
+        try:
+            _process_gptq_weights_after_loading(layer, weight_bits=4, desc_act=True, use_v2_format=False)
+        except NotImplementedError as e:
+            if "tensor_parallel_size>1" in str(e):
+                pytest.fail("TP=1 wrongly raised the TP guard")
+        except Exception:
+            # Reached processing past the guard (expected without NPU) — OK.
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -632,7 +692,8 @@ class TestNPUOperatorIntegration:
         offset = torch.randn(K // group_size, N, dtype=torch.float16).npu()
 
         out = torch_npu.npu_weight_quant_batchmatmul(
-            x, qweight,
+            x,
+            qweight,
             antiquant_scale=scale,
             antiquant_offset=offset,
             antiquant_group_size=group_size,

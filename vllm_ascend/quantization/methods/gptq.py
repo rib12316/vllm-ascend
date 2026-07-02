@@ -221,9 +221,31 @@ def _process_gptq_weights_after_loading(
     # (the permutation does not preserve group boundaries), so we KEEP the
     # weight permuted and instead gather the ACTIVATION by g_idx at runtime
     # (see _apply_gptq_linear): x_perm[:, i] = x[:, g_idx[i]] recovers the
-    # correct feature<->weight pairing. (TP=1 only; TP>1 + desc_act is not
-    # supported, matching the MoE desc_act rejection.)
+    # correct feature<->weight pairing.
     if desc_act and hasattr(layer, "g_idx") and layer.g_idx.numel() > 0:
+        # Guard: TP>1 + desc_act is unsupported. Row-parallel layers (e.g.
+        # down_proj / o_proj) shard the input dim across TP ranks, so the
+        # runtime activation gather x[perm] (perm = argsort of the LOCAL
+        # shard's g_idx) would reorder a sharded activation inconsistently,
+        # silently corrupting output. Fail loud instead, matching the MoE
+        # desc_act rejection and the documented "TP=1 only" constraint.
+        # (Only enforced when the TP group is initialized — i.e. inside a
+        # running engine; in unit-test contexts without distributed init we
+        # assume TP=1, which is the only meaningful setting there.)
+        from vllm.distributed import (
+            get_tensor_model_parallel_world_size,
+            model_parallel_is_initialized,
+        )
+
+        if model_parallel_is_initialized() and get_tensor_model_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "GPTQ desc_act=True is not supported on Ascend NPU with "
+                "tensor_parallel_size>1: the input dimension is sharded "
+                "across TP ranks, which breaks the per-group g_idx activation "
+                "gather. Please run with tensor_parallel_size=1 for "
+                "desc_act=True GPTQ models (same limitation as GPTQ MoE "
+                "desc_act).",
+            )
         # g_idx[i] = quantization group of input feature i (values are group
         # indices 0..num_groups-1, NOT a feature permutation). argsort(g_idx)
         # group-sorts the weight so consecutive G columns form one group — this
