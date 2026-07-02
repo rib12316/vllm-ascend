@@ -46,11 +46,11 @@ before the op call. The real fused_experts path never Python-slices experts.
 Requires torch_npu + NPU hardware.
 """
 
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch_npu  # noqa: F401
-from unittest.mock import patch
-
 from vllm.config import VllmConfig, set_current_vllm_config
 
 
@@ -62,6 +62,7 @@ def default_vllm_config():
         clear_ascend_config,
         init_ascend_config,
     )
+
     cfg = VllmConfig()
     with patch("vllm_ascend.platform.NPUPlatform.check_and_update_config"):
         init_ascend_config(cfg)
@@ -73,10 +74,10 @@ def default_vllm_config():
 
 # Geometry
 E = 2
-H = 256       # hidden (w13 input / w2 output)
-IN = 128      # intermediate (w13 half-output / w2 input)
-GS = 64       # group_size (must be multiple of 32 for the NPU op)
-M = 8         # tokens
+H = 256  # hidden (w13 input / w2 output)
+IN = 128  # intermediate (w13 half-output / w2 input)
+GS = 64  # group_size (must be multiple of 32 for the NPU op)
+M = 8  # tokens
 DTYPE = torch.float16
 
 
@@ -93,6 +94,7 @@ def _clean_npu(t):
 # the oracle is exact.
 # ---------------------------------------------------------------------------
 
+
 def pack_gptq_weight(q_uint, num_bits):
     """Pack along INPUT dim (dim=-2), GPTQ standard order.
 
@@ -102,7 +104,7 @@ def pack_gptq_weight(q_uint, num_bits):
     lead, K, N = q_uint.shape[:-2], q_uint.shape[-2], q_uint.shape[-1]
     packed = torch.zeros((*lead, K // pf, N), dtype=torch.int32)
     for i in range(pf):
-        packed |= (q_uint[..., i::pf, :].to(torch.int32) << (num_bits * i))
+        packed |= q_uint[..., i::pf, :].to(torch.int32) << (num_bits * i)
     return packed
 
 
@@ -114,7 +116,7 @@ def pack_gptq_qzeros(zp_uint, num_bits):
     lead, N = zp_uint.shape[:-1], zp_uint.shape[-1]
     packed = torch.zeros((*lead, N // pf), dtype=torch.int32)
     for i in range(pf):
-        packed |= (zp_uint[..., i::pf].to(torch.int32) << (num_bits * i))
+        packed |= zp_uint[..., i::pf].to(torch.int32) << (num_bits * i)
     return packed
 
 
@@ -130,17 +132,17 @@ def pack_awq(q_uint, num_bits):
     lead, N = q_uint.shape[:-1], q_uint.shape[-1]
     packed = torch.zeros((*lead, N // pf), dtype=torch.int32)
     for i in range(pf):
-        packed |= (q_uint[..., i::pf].to(torch.int32) << (order[i] * num_bits))
+        packed |= q_uint[..., i::pf].to(torch.int32) << (order[i] * num_bits)
     return packed
 
 
 def reference_output(x, q_uint, zp_uint, scale, gs):
     """Dense reference per expert: out[e] = x @ W_ref[e],
     W_ref[e][k,n] = (q[e,k,n] - zp[e,k//gs,n]) * scale[e,k//gs,n]."""
-    zp_exp = zp_uint.repeat_interleave(gs, dim=1)        # (E, K, N)
-    scale_exp = scale.repeat_interleave(gs, dim=1)       # (E, K, N)
+    zp_exp = zp_uint.repeat_interleave(gs, dim=1)  # (E, K, N)
+    scale_exp = scale.repeat_interleave(gs, dim=1)  # (E, K, N)
     w_ref = (q_uint.to(torch.float32) - zp_exp.to(torch.float32)) * scale_exp.to(torch.float32)
-    return torch.matmul(x.to(torch.float32), w_ref)     # (E, M, N)
+    return torch.matmul(x.to(torch.float32), w_ref)  # (E, M, N)
 
 
 def _assert_rel(out_npu, out_ref, tag, e, tol=0.06):
@@ -148,12 +150,12 @@ def _assert_rel(out_npu, out_ref, tag, e, tol=0.06):
     max_abs = b.abs().max().item()
     rel = (a - b).abs().max().item() / max(max_abs, 1e-6)
     assert rel < tol, (
-        f"[{tag} expert {e}] max_diff={(a-b).abs().max().item():.4f} "
-        f"max_abs={max_abs:.4f} rel_err={rel:.4f} exceeds {tol*100:.0f}%")
+        f"[{tag} expert {e}] max_diff={(a - b).abs().max().item():.4f} "
+        f"max_abs={max_abs:.4f} rel_err={rel:.4f} exceeds {tol * 100:.0f}%"
+    )
 
 
-def _build_layer(scheme, w_specs, pq_specs, raw_weight, raw_zp, raw_scale,
-                 device):
+def _build_layer(scheme, w_specs, pq_specs, raw_weight, raw_zp, raw_scale, device):
     """Fill the get_weight/get_dynamic_quant_param tensors with packed known
     values, build an nn.Module, and run process_weights_after_loading."""
     w_specs[raw_weight["qw"]].copy_(raw_weight["packed"])
@@ -161,8 +163,7 @@ def _build_layer(scheme, w_specs, pq_specs, raw_weight, raw_zp, raw_scale,
     pq_specs[raw_zp["qz"]].copy_(raw_zp["packed"])
     layer = torch.nn.Module()
     for name, t in {**w_specs, **pq_specs}.items():
-        layer.register_parameter(
-            name, torch.nn.Parameter(t.clone(), requires_grad=False))
+        layer.register_parameter(name, torch.nn.Parameter(t.clone(), requires_grad=False))
     if device == "npu":
         layer = layer.npu()
     scheme.process_weights_after_loading(layer)
@@ -172,7 +173,8 @@ def _build_layer(scheme, w_specs, pq_specs, raw_weight, raw_zp, raw_scale,
 def _npu_dequant(weight_e, scale_e, offset_e, k_dim):
     x = torch.randn(M, k_dim, dtype=DTYPE).npu()
     out = torch_npu.npu_weight_quant_batchmatmul(
-        x, _clean_npu(weight_e),
+        x,
+        _clean_npu(weight_e),
         antiquant_scale=_clean_npu(scale_e),
         antiquant_offset=_clean_npu(offset_e),
         antiquant_group_size=GS,
@@ -193,11 +195,10 @@ class TestGPTQMoEW4A16:
         from vllm_ascend.quantization.methods.gptq import (
             AscendW4A16GPTQFusedMoEMethod,
         )
-        cfg = GPTQConfig(weight_bits=4, group_size=GS, desc_act=False,
-                         checkpoint_format="gptq_v2" if use_v2 else "")
+
+        cfg = GPTQConfig(weight_bits=4, group_size=GS, desc_act=False, checkpoint_format="gptq_v2" if use_v2 else "")
         scheme = AscendW4A16GPTQFusedMoEMethod(cfg)
-        return scheme, scheme.get_weight(E, IN, H, DTYPE), \
-            scheme.get_dynamic_quant_param(E, IN, H, DTYPE), use_v2
+        return scheme, scheme.get_weight(E, IN, H, DTYPE), scheme.get_dynamic_quant_param(E, IN, H, DTYPE), use_v2
 
     def _fill(self, scheme, w, pq, use_v2, which):
         K, N = (H, 2 * IN) if which == "w13" else (IN, H)
@@ -206,30 +207,28 @@ class TestGPTQMoEW4A16:
         zp_uint = torch.randint(0, 16, (E, K // GS, N))
         scale = torch.rand(E, K // GS, N) * 0.1 + 0.01
         layer = _build_layer(
-            scheme, w, pq,
+            scheme,
+            w,
+            pq,
             {"qw": qw, "packed": pack_gptq_weight(q_uint, 4)},
             {"qz": qz, "packed": pack_gptq_qzeros(zp_uint, 4)},
-            {"sc": sc, "val": scale}, device="npu")  # int4pack needs NPU
+            {"sc": sc, "val": scale},
+            device="npu",
+        )  # int4pack needs NPU
         zp_eff = zp_uint + (0 if use_v2 else 1)
         return layer, q_uint, zp_eff, scale, (K, N)
 
     def test_w13_correctness(self):
         layer, q_uint, zp_eff, scale, (K, N) = self._fill(*self._setup(), "w13")
         for e in range(E):
-            x, out = _npu_dequant(
-                layer.w13_qweight.data[e], layer.w13_scales.data[e],
-                layer.w13_qzeros.data[e], K)
-            _assert_rel(out, reference_output(x.cpu(), q_uint, zp_eff, scale, GS)[e],
-                        "GPTQ W4 w13", e)
+            x, out = _npu_dequant(layer.w13_qweight.data[e], layer.w13_scales.data[e], layer.w13_qzeros.data[e], K)
+            _assert_rel(out, reference_output(x.cpu(), q_uint, zp_eff, scale, GS)[e], "GPTQ W4 w13", e)
 
     def test_w2_correctness(self):
         layer, q_uint, zp_eff, scale, (K, N) = self._fill(*self._setup(), "w2")
         for e in range(E):
-            x, out = _npu_dequant(
-                layer.w2_qweight.data[e], layer.w2_scales.data[e],
-                layer.w2_qzeros.data[e], K)
-            _assert_rel(out, reference_output(x.cpu(), q_uint, zp_eff, scale, GS)[e],
-                        "GPTQ W4 w2", e)
+            x, out = _npu_dequant(layer.w2_qweight.data[e], layer.w2_scales.data[e], layer.w2_qzeros.data[e], K)
+            _assert_rel(out, reference_output(x.cpu(), q_uint, zp_eff, scale, GS)[e], "GPTQ W4 w2", e)
 
     def test_layout_is_input_first(self):
         # Must match the shipping W4A16 target layout consumed by fused_experts.
@@ -253,11 +252,10 @@ class TestGPTQMoEW8A16:
         from vllm_ascend.quantization.methods.gptq import (
             AscendW8A16GPTQFusedMoEMethod,
         )
-        cfg = GPTQConfig(weight_bits=8, group_size=GS, desc_act=False,
-                         checkpoint_format="gptq_v2")
+
+        cfg = GPTQConfig(weight_bits=8, group_size=GS, desc_act=False, checkpoint_format="gptq_v2")
         scheme = AscendW8A16GPTQFusedMoEMethod(cfg)
-        return scheme, scheme.get_weight(E, IN, H, DTYPE), \
-            scheme.get_dynamic_quant_param(E, IN, H, DTYPE)
+        return scheme, scheme.get_weight(E, IN, H, DTYPE), scheme.get_dynamic_quant_param(E, IN, H, DTYPE)
 
     def _fill(self, scheme, w, pq, which):
         K, N = (H, 2 * IN) if which == "w13" else (IN, H)
@@ -266,10 +264,14 @@ class TestGPTQMoEW8A16:
         zp_uint = torch.randint(0, 256, (E, K // GS, N))
         scale = torch.rand(E, K // GS, N) * 0.01 + 0.001
         layer = _build_layer(
-            scheme, w, pq,
+            scheme,
+            w,
+            pq,
             {"qw": qw, "packed": pack_gptq_weight(q_uint, 8)},
             {"qz": qz, "packed": pack_gptq_qzeros(zp_uint, 8)},
-            {"sc": sc, "val": scale}, device="cpu")
+            {"sc": sc, "val": scale},
+            device="cpu",
+        )
         return layer, q_uint, zp_uint, scale, (K, N)
 
     def test_dequant_math_w13(self):
@@ -279,20 +281,21 @@ class TestGPTQMoEW8A16:
         from vllm_ascend.quantization.methods.gptq import (
             _unpack_qweight_from_int32,
         )
+
         scheme, w, pq = self._setup()
         layer, q_uint, zp_uint, scale, (K, N) = self._fill(scheme, w, pq, "w13")
-        sint8 = _unpack_qweight_from_int32(
-            pack_gptq_weight(q_uint, 8).flatten(0, 1), 8).view(E, K, N)
+        sint8 = _unpack_qweight_from_int32(pack_gptq_weight(q_uint, 8).flatten(0, 1), 8).view(E, K, N)
         for e in range(E):
             offset = -(zp_uint.to(torch.float32) - 128)[e]
             x = torch.randn(M, K, dtype=DTYPE).npu()
             out = torch_npu.npu_weight_quant_batchmatmul(
-                x, _clean_npu(sint8[e]),  # int8 weight, like the linear 8-bit path
+                x,
+                _clean_npu(sint8[e]),  # int8 weight, like the linear 8-bit path
                 antiquant_scale=_clean_npu(scale.to(DTYPE)[e]),
                 antiquant_offset=_clean_npu(offset.to(DTYPE)),
-                antiquant_group_size=GS)
-            _assert_rel(out, reference_output(x.cpu(), q_uint, zp_uint, scale, GS)[e],
-                        "GPTQ W8 w13", e)
+                antiquant_group_size=GS,
+            )
+            _assert_rel(out, reference_output(x.cpu(), q_uint, zp_uint, scale, GS)[e], "GPTQ W8 w13", e)
 
     def test_int32_view_roundtrip(self):
         # Production 8-bit MoE views int8 (E,K,N) as int32 (E,K,N//4) for
@@ -300,14 +303,13 @@ class TestGPTQMoEW8A16:
         from vllm_ascend.quantization.methods.gptq import (
             _unpack_qweight_from_int32,
         )
+
         scheme, w, pq = self._setup()
         layer, q_uint, *_ = self._fill(scheme, w, pq, "w13")
         assert layer.w13_qweight.shape == (E, H, 2 * IN // 4)
-        expected = _unpack_qweight_from_int32(
-            pack_gptq_weight(q_uint, 8).flatten(0, 1), 8).view(E, H, 2 * IN)
+        expected = _unpack_qweight_from_int32(pack_gptq_weight(q_uint, 8).flatten(0, 1), 8).view(E, H, 2 * IN)
         got = layer.w13_qweight.data.view(torch.int8).reshape(E, H, 2 * IN)
-        assert torch.equal(got, expected.to(torch.int8)), (
-            "8-bit int32 storage view corrupted weight data")
+        assert torch.equal(got, expected.to(torch.int8)), "8-bit int32 storage view corrupted weight data"
 
     def test_layout_is_input_first(self):
         scheme, w, pq = self._setup()
@@ -329,10 +331,9 @@ class TestAWQMoEW4A16:
         from vllm_ascend.quantization.methods.w4a16_awq import (
             AscendW4A16AWQFusedMoEMethod,
         )
-        scheme = AscendW4A16AWQFusedMoEMethod(
-            AWQConfig(weight_bits=4, group_size=GS, zero_point=True))
-        return scheme, scheme.get_weight(E, IN, H, DTYPE), \
-            scheme.get_dynamic_quant_param(E, IN, H, DTYPE)
+
+        scheme = AscendW4A16AWQFusedMoEMethod(AWQConfig(weight_bits=4, group_size=GS, zero_point=True))
+        return scheme, scheme.get_weight(E, IN, H, DTYPE), scheme.get_dynamic_quant_param(E, IN, H, DTYPE)
 
     def _fill(self, scheme, w, pq, which):
         K, N = (H, 2 * IN) if which == "w13" else (IN, H)
@@ -341,29 +342,27 @@ class TestAWQMoEW4A16:
         zp_uint = torch.randint(0, 16, (E, K // GS, N))
         scale = torch.rand(E, K // GS, N) * 0.1 + 0.01
         layer = _build_layer(
-            scheme, w, pq,
+            scheme,
+            w,
+            pq,
             {"qw": qw, "packed": pack_awq(q_uint, 4)},
             {"qz": qz, "packed": pack_awq(zp_uint, 4)},
-            {"sc": sc, "val": scale}, device="cpu")
+            {"sc": sc, "val": scale},
+            device="cpu",
+        )
         return layer, q_uint, zp_uint, scale, (K, N)
 
     def test_w13_correctness(self):
         layer, q_uint, zp_uint, scale, (K, N) = self._fill(*self._setup(), "w13")
         for e in range(E):
-            x, out = _npu_dequant(
-                layer.w13_qweight.data[e], layer.w13_scales.data[e],
-                layer.w13_qzeros.data[e], K)
-            _assert_rel(out, reference_output(x.cpu(), q_uint, zp_uint, scale, GS)[e],
-                        "AWQ w13", e)
+            x, out = _npu_dequant(layer.w13_qweight.data[e], layer.w13_scales.data[e], layer.w13_qzeros.data[e], K)
+            _assert_rel(out, reference_output(x.cpu(), q_uint, zp_uint, scale, GS)[e], "AWQ w13", e)
 
     def test_w2_correctness(self):
         layer, q_uint, zp_uint, scale, (K, N) = self._fill(*self._setup(), "w2")
         for e in range(E):
-            x, out = _npu_dequant(
-                layer.w2_qweight.data[e], layer.w2_scales.data[e],
-                layer.w2_qzeros.data[e], K)
-            _assert_rel(out, reference_output(x.cpu(), q_uint, zp_uint, scale, GS)[e],
-                        "AWQ w2", e)
+            x, out = _npu_dequant(layer.w2_qweight.data[e], layer.w2_scales.data[e], layer.w2_qzeros.data[e], K)
+            _assert_rel(out, reference_output(x.cpu(), q_uint, zp_uint, scale, GS)[e], "AWQ w2", e)
 
     def test_layout_is_input_first(self):
         layer, *_ = self._fill(*self._setup(), "w13")
@@ -384,8 +383,8 @@ class TestMoEDescActRejection:
         from vllm_ascend.quantization.methods.gptq import (
             AscendW4A16GPTQFusedMoEMethod,
         )
-        scheme = AscendW4A16GPTQFusedMoEMethod(
-            GPTQConfig(weight_bits=4, group_size=GS, desc_act=True))
+
+        scheme = AscendW4A16GPTQFusedMoEMethod(GPTQConfig(weight_bits=4, group_size=GS, desc_act=True))
         with pytest.raises(NotImplementedError, match="desc_act"):
             scheme.process_weights_after_loading(torch.nn.Module())
 
@@ -394,8 +393,8 @@ class TestMoEDescActRejection:
         from vllm_ascend.quantization.methods.gptq import (
             AscendW8A16GPTQFusedMoEMethod,
         )
-        scheme = AscendW8A16GPTQFusedMoEMethod(
-            GPTQConfig(weight_bits=8, group_size=GS, desc_act=True))
+
+        scheme = AscendW8A16GPTQFusedMoEMethod(GPTQConfig(weight_bits=8, group_size=GS, desc_act=True))
         with pytest.raises(NotImplementedError, match="desc_act"):
             scheme.process_weights_after_loading(torch.nn.Module())
 
@@ -410,57 +409,56 @@ class TestMoEValueErrorGuards:
         from vllm_ascend.quantization.methods.w4a16_awq import (
             AscendW4A16AWQFusedMoEMethod,
         )
-        scheme = AscendW4A16AWQFusedMoEMethod(
-            AWQConfig(weight_bits=4, group_size=GS, zero_point=True))
+
+        scheme = AscendW4A16AWQFusedMoEMethod(AWQConfig(weight_bits=4, group_size=GS, zero_point=True))
         # hidden_sizes=257 is not divisible by pack_factor=8
         with pytest.raises(ValueError, match="pack_factor"):
-            scheme.get_weight(num_experts=2, intermediate_size_per_partition=128,
-                              hidden_sizes=257, params_dtype=DTYPE)
+            scheme.get_weight(num_experts=2, intermediate_size_per_partition=128, hidden_sizes=257, params_dtype=DTYPE)
 
     def test_gptq_w4_moe_pack_factor_guard(self):
         from vllm_ascend.quantization.gptq_config import GPTQConfig
         from vllm_ascend.quantization.methods.gptq import (
             AscendW4A16GPTQFusedMoEMethod,
         )
-        scheme = AscendW4A16GPTQFusedMoEMethod(
-            GPTQConfig(weight_bits=4, group_size=GS, desc_act=False))
+
+        scheme = AscendW4A16GPTQFusedMoEMethod(GPTQConfig(weight_bits=4, group_size=GS, desc_act=False))
         with pytest.raises(ValueError, match="pack_factor"):
-            scheme.get_weight(num_experts=2, intermediate_size_per_partition=128,
-                              hidden_sizes=257, params_dtype=DTYPE)
+            scheme.get_weight(num_experts=2, intermediate_size_per_partition=128, hidden_sizes=257, params_dtype=DTYPE)
 
     def test_gptq_w8_moe_pack_factor_guard(self):
         from vllm_ascend.quantization.gptq_config import GPTQConfig
         from vllm_ascend.quantization.methods.gptq import (
             AscendW8A16GPTQFusedMoEMethod,
         )
-        scheme = AscendW8A16GPTQFusedMoEMethod(
-            GPTQConfig(weight_bits=8, group_size=GS, desc_act=False))
+
+        scheme = AscendW8A16GPTQFusedMoEMethod(GPTQConfig(weight_bits=8, group_size=GS, desc_act=False))
         with pytest.raises(ValueError, match="pack_factor"):
-            scheme.get_weight(num_experts=2, intermediate_size_per_partition=127,
-                              hidden_sizes=256, params_dtype=DTYPE)
+            scheme.get_weight(num_experts=2, intermediate_size_per_partition=127, hidden_sizes=256, params_dtype=DTYPE)
 
     def test_awq_moe_group_size_guard(self):
         from vllm_ascend.quantization.awq_config import AWQConfig
         from vllm_ascend.quantization.methods.w4a16_awq import (
             AscendW4A16AWQFusedMoEMethod,
         )
-        scheme = AscendW4A16AWQFusedMoEMethod(
-            AWQConfig(weight_bits=4, group_size=GS, zero_point=True))
+
+        scheme = AscendW4A16AWQFusedMoEMethod(AWQConfig(weight_bits=4, group_size=GS, zero_point=True))
         # intermediate=100 not divisible by group_size=64
         with pytest.raises(ValueError, match="divisible"):
-            scheme.get_dynamic_quant_param(num_experts=2, intermediate_size_per_partition=100,
-                                           hidden_sizes=256, params_dtype=DTYPE)
+            scheme.get_dynamic_quant_param(
+                num_experts=2, intermediate_size_per_partition=100, hidden_sizes=256, params_dtype=DTYPE
+            )
 
     def test_gptq_moe_group_size_guard(self):
         from vllm_ascend.quantization.gptq_config import GPTQConfig
         from vllm_ascend.quantization.methods.gptq import (
             AscendW4A16GPTQFusedMoEMethod,
         )
-        scheme = AscendW4A16GPTQFusedMoEMethod(
-            GPTQConfig(weight_bits=4, group_size=GS, desc_act=False))
+
+        scheme = AscendW4A16GPTQFusedMoEMethod(GPTQConfig(weight_bits=4, group_size=GS, desc_act=False))
         with pytest.raises(ValueError, match="divisible"):
-            scheme.get_dynamic_quant_param(num_experts=2, intermediate_size_per_partition=100,
-                                           hidden_sizes=256, params_dtype=DTYPE)
+            scheme.get_dynamic_quant_param(
+                num_experts=2, intermediate_size_per_partition=100, hidden_sizes=256, params_dtype=DTYPE
+            )
 
     def test_activation_guard_is_value_error(self):
         # The activation guard must raise ValueError (not assert), so it is not
@@ -470,13 +468,80 @@ class TestMoEValueErrorGuards:
         from vllm_ascend.quantization.methods.w4a16_awq import (
             AscendW4A16AWQFusedMoEMethod,
         )
-        scheme = AscendW4A16AWQFusedMoEMethod(
-            AWQConfig(weight_bits=4, group_size=GS, zero_point=True))
+
+        scheme = AscendW4A16AWQFusedMoEMethod(AWQConfig(weight_bits=4, group_size=GS, zero_point=True))
         x = torch.zeros(1, H, dtype=DTYPE)
         router = torch.zeros(1, E, dtype=DTYPE)
         with pytest.raises(ValueError, match="SiLU"):
-            scheme.apply(torch.nn.Module(), x, router, top_k=1, renormalize=True,
-                         num_experts=E, activation="gelu")
+            scheme.apply(torch.nn.Module(), x, router, top_k=1, renormalize=True, num_experts=E, activation="gelu")
+
+
+# ---------------------------------------------------------------------------
+# GPTQ LINEAR desc_act (Bug#17 regression guard)
+# ---------------------------------------------------------------------------
+
+
+class TestGPTQLinearDescAct:
+    """Regression guard for Bug#17: desc_act=True must permute BOTH the weight
+    and the activation by argsort(g_idx).
+
+    The original code permuted only the weight, leaving scales/activation
+    unaligned -> garbage on real desc_act=true models (TheBloke/TinyLlama).
+    Validated end-to-end there (-> "Paris"); this is the synthetic NPU
+    round-trip with a NON-trivial g_idx (argsort != identity), which the
+    original weak synthetic test (trivial g_idx) failed to exercise.
+    """
+
+    def test_nontrivial_g_idx_matches_dense_oracle(self):
+        torch.manual_seed(0)
+        K, N, GS = 256, 64, 128
+        G = K // GS
+        from vllm_ascend.quantization.gptq_config import GPTQConfig
+        from vllm_ascend.quantization.methods.gptq import (
+            AscendW4A16GPTQLinearScheme,
+        )
+
+        cfg = GPTQConfig(weight_bits=4, group_size=GS, desc_act=True, checkpoint_format="gptq_v2")
+        scheme = AscendW4A16GPTQLinearScheme(cfg)
+
+        # Non-trivial g_idx: alternate groups so argsort(g_idx) != identity,
+        # while keeping exactly GS features per group.
+        g_idx = torch.zeros(K, dtype=torch.int32)
+        g_idx[1::2] = 1
+        assert not torch.equal(g_idx, torch.arange(K) // GS), "g_idx must be non-trivial"
+
+        q_uint = torch.randint(0, 16, (K, N))
+        zp_uint = torch.randint(0, 16, (G, N))  # v2: used directly
+        scale = torch.rand(G, N) * 0.1 + 0.01
+
+        # Build the layer manually: Linear get_weight embeds int metadata
+        # (_packed_dim/_packed_factor) which _build_layer (written for the MoE
+        # tensor-only spec) cannot register. process_weights only reads the four
+        # tensor params below.
+        layer = torch.nn.Module()
+        for name, tensor in {
+            "qweight": pack_gptq_weight(q_uint, 4),
+            "g_idx": g_idx,
+            "qzeros": pack_gptq_qzeros(zp_uint, 4),
+            "scales": scale.to(DTYPE),
+        }.items():
+            layer.register_parameter(name, torch.nn.Parameter(tensor, requires_grad=False))
+        layer = layer.npu()
+        scheme.process_weights_after_loading(layer)
+
+        x = torch.randn(8, K, dtype=DTYPE, device="npu")
+        out_npu = scheme.apply(layer, x, bias=None).cpu().float()
+
+        # Dense oracle: feature k belongs to group g_idx[k], so its zp/scale are
+        # zp[g_idx[k]] / scale[g_idx[k]] (NOT k//GS — that is the whole point of
+        # desc_act and what the original code got wrong). Index the group dim
+        # with the 1-D g_idx -> (K, N).
+        grp = g_idx.long()  # (K,)
+        zp_exp = zp_uint[grp]  # (K, N)
+        scale_exp = scale[grp]  # (K, N)
+        w_ref = (q_uint.float() - zp_exp.float()) * scale_exp.float()
+        out_ref = x.cpu().float() @ w_ref
+        _assert_rel(out_npu, out_ref, "GPTQ Linear desc_act", e=0)
 
 
 if __name__ == "__main__":
