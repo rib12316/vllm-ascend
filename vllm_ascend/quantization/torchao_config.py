@@ -57,6 +57,7 @@ import re
 from typing import Any
 
 import torch
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import (
@@ -201,6 +202,16 @@ class TorchAOConfig(QuantizationConfig):
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> LinearMethodBase | QuantizeMethodBase | None:
+        if isinstance(layer, FusedMoE):
+            # MoE expert quantization is out of MVP scope (T-11): it would need
+            # per-expert dequant/repack into ``fused_experts`` (like AWQ/GPTQ
+            # MoE). Fail loudly instead of silently falling back to dense
+            # experts (mirrors gguf_config.py's GGUF MoE guard).
+            raise NotImplementedError(
+                "torchao MoE on Ascend NPU is not yet supported (planned: "
+                "dequant/repack experts -> fused_experts). Please use a "
+                "non-MoE model, or use AWQ/GPTQ for MoE expert quantization.",
+            )
         if not isinstance(layer, LinearBase):
             return None
         if _is_layer_skipped(prefix, self.modules_to_not_convert):
