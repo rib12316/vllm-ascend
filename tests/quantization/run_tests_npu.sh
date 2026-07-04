@@ -246,8 +246,7 @@ log_info "阶段 2: 单元测试（不需要 NPU）"
 log_sep
 
 log_info "运行 pytest 单元测试..."
-python3 -m pytest tests/quantization/test_awq_gptq.py -v \
-    -k "not NPUOperator" \
+python3 -m pytest tests/ut/quantization/test_awq_gptq.py -v \
     --tb=short \
     2>&1 | tee "${TEST_OUTPUT_DIR}/unit_test_results.txt" || true
 
@@ -301,8 +300,7 @@ log_sep
 log_info "阶段 5: NPU 算子集成测试"
 log_sep
 
-python3 -m pytest tests/quantization/test_awq_gptq.py -v \
-    -k "NPUOperator" \
+python3 -m pytest tests/e2e/singlecard/test_quant_npu_operator_smoke.py -v \
     --tb=short \
     2>&1 | tee "${TEST_OUTPUT_DIR}/npu_operator_results.txt" || true
 

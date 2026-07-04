@@ -31,7 +31,7 @@ a pure-torch reference reconstructed from the quantized params:
 Requires Ascend NPU hardware; skipped otherwise. All tensors live on NPU.
 
 Usage:
-    pytest tests/quantization/test_torchao_synthetic_npu.py -v
+    pytest tests/e2e/singlecard/test_quant_torchao_synthetic.py -v
 """
 
 import pytest

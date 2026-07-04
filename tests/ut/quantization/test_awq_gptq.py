@@ -20,14 +20,14 @@ AWQ & GPTQ quantization unit tests for Ascend NPU.
 These tests validate weight packing/unpacking, zero-point conversion, and
 the NPU dequantization formula independently of real model loading.
 
-Usage (on NPU machine):
-    pytest tests/quantization/test_awq_gptq.py -v
+Usage (CPU-runnable; no NPU required):
+    pytest tests/ut/quantization/test_awq_gptq.py -v
 
     # Run only AWQ tests
-    pytest tests/quantization/test_awq_gptq.py -v -k awq
+    pytest tests/ut/quantization/test_awq_gptq.py -v -k awq
 
     # Run only GPTQ tests
-    pytest tests/quantization/test_awq_gptq.py -v -k gptq
+    pytest tests/ut/quantization/test_awq_gptq.py -v -k gptq
 """
 
 import struct
@@ -658,67 +658,9 @@ class TestNPUFormulaEquivalence:
         torch.testing.assert_close(actual_zeros, expected)
 
 
-# ---------------------------------------------------------------------------
-# NPU operator integration tests (require torch_npu)
-# ---------------------------------------------------------------------------
-
-
-class TestNPUOperatorIntegration:
-    """Tests that require torch_npu and NPU hardware.
-
-    These tests will be skipped if torch_npu is not available.
-    """
-
-    @pytest.fixture(autouse=True)
-    def skip_without_npu(self):
-        pytest.importorskip("torch_npu", reason="torch_npu not available")
-        # Probe the actual tensor method: under TORCH_DEVICE_BACKEND_AUTOLOAD=0
-        # the torch_npu package imports and torch.npu.is_available() can return
-        # True, but the ``.npu()`` tensor method isn't registered — so the test
-        # would AttributeError instead of skip. Require both the namespace and
-        # the tensor method.
-        if not hasattr(torch, "npu") or not hasattr(torch.Tensor, "npu"):
-            pytest.skip("No NPU device available")
-        if not torch.npu.is_available():
-            pytest.skip("No NPU device available")
-
-    def test_npu_weight_quant_batchmatmul_runs(self):
-        """Test that npu_weight_quant_batchmatmul runs without error."""
-        import torch_npu
-
-        # Weight layout for AWQ/GPTQ: (K, N_packed) where N_packed = N / 8.
-        # The operator checks x.shape[-1] (K) == weight.shape[0] (K).
-        # Constraint: group_size must be a multiple of 32 in [32, K-1].
-        M, K, N = 4, 256, 32
-        group_size = 64
-        N_packed = N // 8  # = 4
-
-        x = torch.randn(M, K, dtype=torch.float16).npu()
-        qweight = torch.randint(0, 100, (K, N_packed), dtype=torch.int32).npu()
-        scale = torch.randn(K // group_size, N, dtype=torch.float16).npu()
-        offset = torch.randn(K // group_size, N, dtype=torch.float16).npu()
-
-        out = torch_npu.npu_weight_quant_batchmatmul(
-            x,
-            qweight,
-            antiquant_scale=scale,
-            antiquant_offset=offset,
-            antiquant_group_size=group_size,
-        )
-
-        assert out.shape == (M, N), f"Expected ({M}, {N}), got {out.shape}"
-
-    def test_npu_convert_weight_to_int4pack_runs(self):
-        """Test that npu_convert_weight_to_int4pack runs without error."""
-        import torch_npu
-
-        K, N = 32, 16
-        weight = torch.randint(-8, 7, (K, N), dtype=torch.int8)
-        weight_int32 = weight.to(torch.int32).npu()
-
-        packed = torch_npu.npu_convert_weight_to_int4pack(weight_int32)
-        assert packed is not None
-        assert packed.is_npu
+# NPU operator smoke tests (require torch_npu) live at
+# tests/e2e/singlecard/test_quant_npu_operator_smoke.py — pure-CPU unit tests
+# must not depend on NPU hardware (developer_guide testing convention).
 
 
 # ---------------------------------------------------------------------------

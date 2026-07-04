@@ -38,8 +38,8 @@ export LD_LIBRARY_PATH="$ASCEND_CUSTOM_OPP_PATH/op_api/lib:$PWD/vllm_ascend:${LD
 step() { printf '\n========== %s ==========\n' "$1"; }
 
 step "1/5 unit tests (137 AWQ/GPTQ-specific; 165 on full fusion branch)"
-python -m pytest tests/quantization/test_awq_gptq.py tests/quantization/test_moe_synthetic_npu.py \
-                 tests/ut/quantization/test_quant_routing.py tests/ut/quantization/test_method_adapters.py -q
+python -m pytest tests/ut/quantization/test_awq_gptq.py tests/ut/quantization/test_quant_routing.py \
+                 tests/ut/quantization/test_method_adapters.py tests/e2e/singlecard/test_quant_moe_synthetic.py -q
 
 step "2/5 real-MoE end-to-end (GPTQ ALL PASS expected)"
 python benchmarks/verify_moe_e2e.py

@@ -11,7 +11,7 @@
 
 This is the MoE counterpart of the linear-model smoke test that verified
 T1/T2/T6 (see logs/e2e/2026-06-12_awq-gptq-inference.log). The MoE
-weight-processing math is covered by tests/quantization/test_moe_synthetic_npu.py,
+weight-processing math is covered by tests/e2e/singlecard/test_quant_moe_synthetic.py,
 but that test explicitly skips the full ``apply -> fused_experts -> grouped_matmul``
 path and real-checkpoint loading. This script closes that gap: it loads the two
 real MoE models on disk, confirms our Ascend MoE quant method is attached, and

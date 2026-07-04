@@ -30,17 +30,19 @@ print('GPTQConfig: OK')
 # 在 vllm-ascend 根目录执行
 cd /path/to/vllm-ascend
 
-# 运行所有 AWQ/GPTQ 单元测试（不需要 NPU）
-pytest tests/quantization/test_awq_gptq.py -v -k "not NPUOperator" --tb=short
+# 运行所有 AWQ/GPTQ 单元测试（纯 CPU，不需要 NPU）
+pytest tests/ut/quantization/test_awq_gptq.py -v --tb=short
 
 # 仅运行 AWQ 测试
-pytest tests/quantization/test_awq_gptq.py -v -k "awq and not NPUOperator"
+pytest tests/ut/quantization/test_awq_gptq.py -v -k "awq"
 
 # 仅运行 GPTQ 测试
-pytest tests/quantization/test_awq_gptq.py -v -k "gptq and not NPUOperator"
+pytest tests/ut/quantization/test_awq_gptq.py -v -k "gptq"
 
-# 运行 NPU 算子集成测试（需要 NPU）
-pytest tests/quantization/test_awq_gptq.py -v -k "NPUOperator" --tb=short
+# 运行 NPU 合成权重 / 算子 smoke 测试（需要 NPU）
+pytest tests/e2e/singlecard/test_quant_moe_synthetic.py \
+       tests/e2e/singlecard/test_quant_torchao_synthetic.py \
+       tests/e2e/singlecard/test_quant_npu_operator_smoke.py -v
 ```
 
 ---
