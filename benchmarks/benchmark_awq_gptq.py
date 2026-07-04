@@ -40,7 +40,9 @@ def get_npu_memory_mb():
     try:
         result = subprocess.run(
             ["npu-smi", "info", "-t", "usages", "-i", "0"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         for line in result.stdout.split("\n"):
             if "Used Capacity" in line:
@@ -65,14 +67,14 @@ def build_env():
 
     import torch
     import torch_npu
+
     lib_paths = [
         "/data/ascend/vllm-ascend/vllm_ascend",
         "/data/ascend/vllm-ascend/vllm_ascend/lib64",
         os.path.join(os.path.dirname(torch.__file__), "lib"),
         os.path.join(os.path.dirname(torch_npu.__file__), "lib"),
     ]
-    env["LD_LIBRARY_PATH"] = ":".join(lib_paths) + ":" + env.get(
-        "LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = ":".join(lib_paths) + ":" + env.get("LD_LIBRARY_PATH", "")
     return env
 
 
@@ -83,10 +85,20 @@ def build_diverse_prompts(n):
     measured throughput mostly reflects decode bandwidth and is inflated vs a
     real mixed load. Diverse prompts force every request through a real prefill.
     """
-    topics = ["machine learning", "climate change", "quantum computing",
-              "renewable energy", "artificial intelligence", "space exploration",
-              "genetic engineering", "blockchain", "neural networks",
-              "cybersecurity", "deep learning", "data science"]
+    topics = [
+        "machine learning",
+        "climate change",
+        "quantum computing",
+        "renewable energy",
+        "artificial intelligence",
+        "space exploration",
+        "genetic engineering",
+        "blockchain",
+        "neural networks",
+        "cybersecurity",
+        "deep learning",
+        "data science",
+    ]
     templates = [
         "Explain {t} in simple terms.",
         "What are the main challenges in {t}?",
@@ -98,8 +110,7 @@ def build_diverse_prompts(n):
     return (base * ((n // len(base)) + 1))[:n]
 
 
-def run_single_model(model_name, quantization, dtype, label_name,
-                     num_prompts, max_tokens, max_model_len, output_dir):
+def run_single_model(model_name, quantization, dtype, label_name, num_prompts, max_tokens, max_model_len, output_dir):
     """Run benchmark for a single model in a fresh subprocess.
 
     Each model gets its own process to avoid NPU state issues between loads.
@@ -139,7 +150,8 @@ max_model_len = {max_model_len}
 output_file = {output_dir!r} + "/single_result.json"
 input_text = "The capital of France is"
 
-print(f"\\n[BENCH] Loading {{label_name}} (model={{model_name}}, quant={{quantization}}, dtype={{dtype}})...", flush=True)
+print(f"\\n[BENCH] Loading {{label_name}} "
+      f"(model={{model_name}}, quant={{quantization}}, dtype={{dtype}})...", flush=True)
 load_start = time.perf_counter()
 llm_kwargs = dict(
     model=model_name,
@@ -281,9 +293,9 @@ print(f"[BENCH] Done {{label_name}}: {{tokens_per_sec:.1f}} tok/s, "
     if os.path.exists(output_file):
         os.remove(output_file)
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f" Starting: {label_name} ({model_name})")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
     subprocess.run(
         [sys.executable, "-c", script],
@@ -304,11 +316,13 @@ print(f"[BENCH] Done {{label_name}}: {{tokens_per_sec:.1f}} tok/s, "
 def main():
     parser = argparse.ArgumentParser(description="AWQ/GPTQ Benchmark for Ascend NPU")
     parser.add_argument(
-        "--label", default="default",
+        "--label",
+        default="default",
         help="Label for this run (e.g., baseline, optimized).",
     )
     parser.add_argument(
-        "--output", default="benchmarks/results",
+        "--output",
+        default="benchmarks/results",
         help="Output directory for results.",
     )
     parser.add_argument("--num-prompts", type=int, default=50)
@@ -319,8 +333,10 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     print(f"Dense vs Quantized Benchmark — {args.label}")
-    print(f"Config: {args.num_prompts} prompts x {args.max_tokens} tokens, "
-          f"max_model_len={args.max_model_len}, eager, greedy")
+    print(
+        f"Config: {args.num_prompts} prompts x {args.max_tokens} tokens, "
+        f"max_model_len={args.max_model_len}, eager, greedy"
+    )
     print(f"NPU memory before: {get_npu_memory_mb():.0f} MB")
 
     # (model, quantization, dtype, label_name)
@@ -341,18 +357,21 @@ def main():
     results = []
     for model_name, quant, dtype, label_name in models:
         r = run_single_model(
-            model_name, quant, dtype, label_name,
-            args.num_prompts, args.max_tokens,
-            args.max_model_len, args.output,
+            model_name,
+            quant,
+            dtype,
+            label_name,
+            args.num_prompts,
+            args.max_tokens,
+            args.max_model_len,
+            args.output,
         )
         if r is not None:
             results.append(r)
 
     # ---- Save aggregate results ----
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    out_file = os.path.join(
-        args.output, f"python_bench_{args.label}_{timestamp}.json"
-    )
+    out_file = os.path.join(args.output, f"python_bench_{args.label}_{timestamp}.json")
 
     output = {
         "label": args.label,
@@ -369,15 +388,14 @@ def main():
         json.dump(output, f, indent=2)
 
     # ---- Print comparison table ----
-    print(f"\n{'='*86}")
+    print(f"\n{'=' * 86}")
     print(f"  BENCHMARK SUMMARY — {args.label}")
     print(f"  {args.num_prompts} prompts x {args.max_tokens} tokens, eager, greedy")
-    print(f"{'='*86}")
+    print(f"{'=' * 86}")
     print(
-        f"  {'Label':<16} {'Load(s)':>8} {'tok/s':>9} {'TTFT(ms)':>9} "
-        f"{'TPOT(ms)':>9} {'p99(ms)':>8} {'HBMpk(MB)':>10}"
+        f"  {'Label':<16} {'Load(s)':>8} {'tok/s':>9} {'TTFT(ms)':>9} {'TPOT(ms)':>9} {'p99(ms)':>8} {'HBMpk(MB)':>10}"
     )
-    print(f"  {'-'*85}")
+    print(f"  {'-' * 85}")
     for r in results:
         print(
             f"  {r['label_name']:<16} {r['load_time_s']:>8.1f} "

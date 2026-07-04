@@ -16,9 +16,8 @@ Usage:
     python benchmarks/micro_benchmark_weight_formats.py
 """
 
-import time
 import json
-import sys
+import time
 
 import torch
 import torch_npu
@@ -88,13 +87,15 @@ def create_int8_weight(K: int, N: int, group_size: int, dtype: torch.dtype, devi
     return qweight, scales, offset, N
 
 
-def benchmark_format(name: str, weight, scales, offset, output_size: int,
-                     x: torch.Tensor, group_size: int, num_iters: int = 50):
+def benchmark_format(
+    name: str, weight, scales, offset, output_size: int, x: torch.Tensor, group_size: int, num_iters: int = 50
+):
     """Benchmark npu_weight_quant_batchmatmul with given weight format."""
     # Warmup
     for _ in range(5):
         _ = torch_npu.npu_weight_quant_batchmatmul(
-            x, weight,
+            x,
+            weight,
             antiquant_scale=scales,
             antiquant_offset=offset,
             antiquant_group_size=group_size,
@@ -107,7 +108,8 @@ def benchmark_format(name: str, weight, scales, offset, output_size: int,
         torch.npu.synchronize()
         start = time.perf_counter()
         out = torch_npu.npu_weight_quant_batchmatmul(
-            x, weight,
+            x,
+            weight,
             antiquant_scale=scales,
             antiquant_offset=offset,
             antiquant_group_size=group_size,
@@ -171,7 +173,6 @@ def main():
         # Memory before
         torch.npu.reset_peak_memory_stats()
         torch.npu.synchronize()
-        mem_before = torch.npu.memory_allocated() / (1024 * 1024)
 
         results = []
 
