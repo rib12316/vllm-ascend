@@ -177,19 +177,23 @@ def _get_gptq_linear_pergroup_spec(
     from qweight's packing along dim=0. This is why qzeros must go in
     ``get_pergroup_param()`` instead of ``get_weight()``.
     """
-    if input_size % group_size != 0:
-        raise ValueError(f"GPTQ input_size ({input_size}) must be divisible by group_size ({group_size}).")
-    if group_size >= input_size:
-        # NPU op npu_weight_quant_batchmatmul requires antiquant_group_size
-        # ∈ {0} ∪ [32, K-1]; group_size == K (the only reachable case here,
-        # since input_size % group_size == 0 is checked above) is rejected at
-        # forward with an opaque error. Reject up front with a clear message.
-        raise ValueError(
-            f"GPTQ group_size ({group_size}) must be < input_size ({input_size}); "
-            f"the NPU fused op rejects antiquant_group_size == K. Use a smaller "
-            f"group_size (e.g. 128)."
-        )
-    num_groups = input_size // group_size
+    if group_size == -1:
+        # per-channel: one scale per output channel; the NPU op is invoked with
+        # antiquant_group_size=0 in apply (see _apply_gptq_linear).
+        num_groups = 1
+    else:
+        if input_size % group_size != 0:
+            raise ValueError(f"GPTQ input_size ({input_size}) must be divisible by group_size ({group_size}).")
+        if group_size >= input_size:
+            # NPU op npu_weight_quant_batchmatmul requires antiquant_group_size
+            # ∈ {0} ∪ [32, K-1]; group_size == K is rejected at forward with an
+            # opaque error. Reject up front with a clear message.
+            raise ValueError(
+                f"GPTQ group_size ({group_size}) must be < input_size ({input_size}); "
+                f"the NPU fused op rejects antiquant_group_size == K. Use a smaller "
+                f"group_size (e.g. 128) or -1 for per-channel."
+            )
+        num_groups = input_size // group_size
     return {
         "scales": torch.empty(num_groups, output_size, dtype=params_dtype),
         "qzeros": torch.empty(num_groups, output_size // pack_factor, dtype=torch.int32),
@@ -336,7 +340,7 @@ def _apply_gptq_linear(
         qweight,
         antiquant_scale=layer.scales,
         antiquant_offset=layer.qzeros,
-        antiquant_group_size=group_size,
+        antiquant_group_size=0 if group_size == -1 else group_size,
         bias=bias,
     )
     # Output size is the original N dimension (saved before repacking).
@@ -496,6 +500,11 @@ def _get_gptq_moe_quant_param(
 
     qzeros are packed along the output dim (last dim), same as the linear path.
     """
+    if group_size <= 0:
+        raise NotImplementedError(
+            f"GPTQ MoE per-channel (group_size={group_size}) is not supported on "
+            f"Ascend NPU. Use a positive group_size (e.g. 128)."
+        )
     if intermediate_size_per_partition % group_size != 0:
         raise ValueError(
             f"GPTQ MoE intermediate_size_per_partition "
@@ -529,11 +538,52 @@ def _get_gptq_moe_quant_param(
     }
 
 
+def _handle_negative_moe_scale(
+    unpacked: torch.Tensor,
+    offset: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    weight_bits: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Absorb negative scales into weight AND offset (NPU fused op requires scale >= 0).
+
+    The NPU fused op computes ``(w + offset) * scale``. Where ``scale < 0``, to
+    keep the product unchanged while making the scale positive we negate BOTH
+    the weight and the offset at the affected positions:
+    ``(-w - off) * |scale| == -(w + off) * |scale| == (w + off) * scale``
+    (since ``scale == -|scale|``). The negated weight is clamped back to the
+    valid signed range. Standard GPTQ checkpoints have all-positive scales, so
+    this is a no-op fast path for them; it only matters for rare checkpoints
+    with calibration-induced negative scales. Ported from SGLang PR #16364
+    (extended to also negate offset, which SGLang omits).
+
+    ``unpacked`` is ``(E, K, N)`` sint; ``offset``/``scales`` are ``(E, K//gs, N)``.
+    Returns ``(unpacked, offset, scales)`` — modified only where scale < 0.
+    """
+    if (scales >= 0).all():
+        return unpacked, offset, scales  # fast path: standard checkpoints
+    neg_group = scales < 0  # (E, G, N)
+    neg_elem = neg_group.repeat_interleave(group_size, dim=1)  # (E, K, N)
+    if neg_elem.any():
+        unpacked = unpacked.clone()
+        unpacked[neg_elem] = -unpacked[neg_elem]
+        if weight_bits == 4:
+            unpacked.clamp_(-8, 7)
+        else:
+            unpacked.clamp_(-128, 127)
+        offset = offset.clone()
+        offset[neg_group] = -offset[neg_group]
+    return unpacked, offset, scales.abs()
+
+
 def _repack_gptq_moe_qweight(
     qweight_data: torch.Tensor,
     weight_bits: int,
     pack_factor: int,
-) -> torch.Tensor:
+    scales: torch.Tensor | None = None,
+    offset: torch.Tensor | None = None,
+    group_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Unpack a GPTQ MoE qweight (packed along the input dim) and repack it into
     the NPU MoE weight layout consumed by ``fused_experts``.
 
@@ -547,16 +597,29 @@ def _repack_gptq_moe_qweight(
       - 8-bit: view 4 consecutive int8 as one int32 → ``(E, K, N // 4)``
 
     This is the single branch where W4A16 and W8A16 diverge.
+
+    If ``scales``, ``offset`` and ``group_size`` are provided, negative scales
+    are absorbed into the unpacked weight AND offset before repacking (see
+    ``_handle_negative_moe_scale``); the (possibly modified) offset and scales
+    are returned alongside the repacked weight.
     """
     unpacked = _unpack_qweight_from_int32(qweight_data.flatten(0, 1), weight_bits).view(
         qweight_data.shape[0], -1, qweight_data.shape[2]
     )
+    new_offset: torch.Tensor | None = None
+    new_scales: torch.Tensor | None = None
+    if scales is not None and offset is not None and group_size is not None:
+        unpacked, new_offset, new_scales = _handle_negative_moe_scale(unpacked, offset, scales, group_size, weight_bits)
     if weight_bits == 4:
         packed = torch_npu.npu_convert_weight_to_int4pack(unpacked.flatten(0, 1).int())
-        return packed.view(
-            qweight_data.shape[0],
-            qweight_data.shape[1] * pack_factor,
-            -1,
+        return (
+            packed.view(
+                qweight_data.shape[0],
+                qweight_data.shape[1] * pack_factor,
+                -1,
+            ),
+            new_offset,
+            new_scales,
         )
     # 8-bit: keep int8, view 4 consecutive int8 as one int32 for grouped_matmul
     # storage. Requires the output dim divisible by 4 (pack_factor for 8-bit);
@@ -566,7 +629,7 @@ def _repack_gptq_moe_qweight(
             "8-bit GPTQ MoE expects the output dim divisible by 4 to reinterpret "
             f"int8 as int32 storage, got last-dim size {unpacked.shape[-1]}."
         )
-    return unpacked.contiguous().view(torch.int32)
+    return unpacked.contiguous().view(torch.int32), new_offset, new_scales
 
 
 def _process_gptq_moe_weights_after_loading(
@@ -575,6 +638,7 @@ def _process_gptq_moe_weights_after_loading(
     pack_factor: int,
     desc_act: bool,
     use_v2_format: bool,
+    group_size: int,
 ) -> None:
     """Shared weight processing for W4A16 and W8A16 GPTQ MoE schemes.
 
@@ -597,30 +661,46 @@ def _process_gptq_moe_weights_after_loading(
 
     center_offset = 1 << (weight_bits - 1)  # 8 for 4-bit, 128 for 8-bit
     for prefix in ("w13", "w2"):
-        # 1. Repack weight for the NPU (int4pack for 4-bit, int32 view for 8-bit).
-        repacked = _repack_gptq_moe_qweight(
-            getattr(layer, f"{prefix}_qweight").data,
-            weight_bits,
-            pack_factor,
-        )
-        layer.register_parameter(
-            f"{prefix}_qweight",
-            torch.nn.Parameter(repacked, requires_grad=False),
-        )
-        # 2. qzeros → antiquant_offset.
-        #    NPU: out = (w + offset) * scale;  GPTQ: out = (w - zeros) * scale
-        #    ⟹ offset = -(zeros - center_offset). center cancels the uint→signed
-        #    shift already applied to the weight in _unpack_qweight_from_int32.
+        scales = getattr(layer, f"{prefix}_scales").data
+        # qzeros → antiquant_offset, computed BEFORE repack so that any
+        # negative-scale absorption can negate it together with the weight.
+        # NPU: out = (w + offset) * scale;  GPTQ: out = (w - zeros) * scale
+        # ⟹ offset = -(zeros - center_offset). center cancels the uint→signed
+        # shift already applied to the weight in _unpack_qweight_from_int32.
         qzeros = _unpack_qzeros_from_int32(
             getattr(layer, f"{prefix}_qzeros").data,
             weight_bits,
             use_v2_format,
         )
         offset = -(qzeros.to(torch.float32) - center_offset)
-        scales_dtype = getattr(layer, f"{prefix}_scales").data.dtype
+        # Repack weight for the NPU (int4pack for 4-bit, int32 view for 8-bit),
+        # absorbing any negative scales into weight AND offset (NPU fused op
+        # requires antiquant_scale >= 0; see _handle_negative_moe_scale).
+        repacked, new_offset, new_scales = _repack_gptq_moe_qweight(
+            getattr(layer, f"{prefix}_qweight").data,
+            weight_bits,
+            pack_factor,
+            scales=scales,
+            offset=offset,
+            group_size=group_size,
+        )
+        scales_dtype = scales.dtype
+        layer.register_parameter(
+            f"{prefix}_qweight",
+            torch.nn.Parameter(repacked, requires_grad=False),
+        )
+        if new_scales is not None:
+            # Scales contained negatives; weight, offset, and scale were adjusted.
+            layer.register_parameter(
+                f"{prefix}_scales",
+                torch.nn.Parameter(new_scales.to(scales_dtype).contiguous(), requires_grad=False),
+            )
+            final_offset = new_offset
+        else:
+            final_offset = offset
         layer.register_parameter(
             f"{prefix}_qzeros",
-            torch.nn.Parameter(offset.to(scales_dtype).contiguous(), requires_grad=False),
+            torch.nn.Parameter(final_offset.to(scales_dtype).contiguous(), requires_grad=False),
         )
 
 
@@ -689,6 +769,7 @@ class _AscendGPTQFusedMoEMethodBase(AscendMoEScheme):
             self.pack_factor,
             self.desc_act,
             self.use_v2_format,
+            self.group_size,
         )
 
     def apply(
@@ -739,6 +820,7 @@ class _AscendGPTQFusedMoEMethodBase(AscendMoEScheme):
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             num_experts=num_experts,
+            tid2eid=tid2eid,
         )
 
         topk_ids = topk_ids.to(torch.int32)

@@ -180,12 +180,9 @@ class GPTQConfig(QuantizationConfig):
                 f"weight packing. Please use a 4-bit or 8-bit GPTQ model instead."
             )
         self.weight_bits = weight_bits
-        if group_size <= 0:
+        if group_size != -1 and group_size <= 0:
             raise ValueError(
-                f"GPTQ group_size must be a positive integer on Ascend NPU, "
-                f"but got {group_size}. Per-channel quantization "
-                f"(group_size=-1) is not supported because the NPU operator "
-                f"npu_weight_quant_batchmatmul requires a positive group_size."
+                f"GPTQ group_size must be -1 (per-channel) or a positive integer on Ascend NPU, but got {group_size}."
             )
         self.group_size = group_size
         self.desc_act = desc_act
@@ -321,6 +318,22 @@ class GPTQConfig(QuantizationConfig):
             # this layer is NOT in the list (i.e., NOT quantized).
             # Note: is_layer_skipped returns True when layer IS in the list,
             # so we invert it: skip when the layer is NOT in the list.
+            # Upstream alignment (gptq_utils.is_layer_gptq_quantized): all
+            # shards of a fused layer (gate_up_proj/qkv_proj) must share the
+            # same quantization state; mixed quantized/unquantized shards raise.
+            if self.modules_in_block_to_quantize:
+                _proj = prefix.split(".")[-1]
+                _shards = self.packed_modules_mapping.get(_proj)
+                if _shards:
+                    _shard_states = {
+                        any(q in prefix.replace(_proj, s) for q in self.modules_in_block_to_quantize) for s in _shards
+                    }
+                    if len(_shard_states) > 1:
+                        raise ValueError(
+                            f"Detected some but not all shards of {prefix} are "
+                            f"quantized. All shards of fused layers must have "
+                            f"the same precision."
+                        )
             not_in_quant_list = self.modules_in_block_to_quantize and not is_layer_skipped(
                 prefix,
                 self.modules_in_block_to_quantize,

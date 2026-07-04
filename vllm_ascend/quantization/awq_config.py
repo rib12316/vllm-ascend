@@ -81,12 +81,10 @@ class AWQConfig(QuantizationConfig):
         self.modules_to_not_convert = modules_to_not_convert or []
         self.lm_head_quantized = lm_head_quantized
 
-        if self.group_size <= 0:
+        if self.group_size != -1 and self.group_size <= 0:
             raise ValueError(
-                f"AWQ group_size must be a positive integer on Ascend NPU, "
-                f"but got {self.group_size}. Per-channel quantization "
-                f"(group_size=-1) is not supported because the NPU operator "
-                f"npu_weight_quant_batchmatmul requires a positive group_size."
+                f"AWQ group_size must be -1 (per-channel) or a positive integer "
+                f"on Ascend NPU, but got {self.group_size}."
             )
         if self.weight_bits != 4:
             raise ValueError(
@@ -181,6 +179,21 @@ class AWQConfig(QuantizationConfig):
         parallel_lm_head_quantized = isinstance(layer, ParallelLMHead) and self.lm_head_quantized
 
         if isinstance(layer, LinearBase) or parallel_lm_head_quantized:
+            # Upstream alignment: all shards of a fused layer must share the
+            # same quantization state; mixed convert/unconvert shards raise.
+            if self.modules_to_not_convert:
+                _proj = prefix.split(".")[-1]
+                _shards = self.packed_modules_mapping.get(_proj)
+                if _shards:
+                    _shard_states = {
+                        any(q in prefix.replace(_proj, s) for q in self.modules_to_not_convert) for s in _shards
+                    }
+                    if len(_shard_states) > 1:
+                        raise ValueError(
+                            f"Detected some but not all shards of {prefix} are "
+                            f"in modules_to_not_convert. All shards of fused "
+                            f"layers must share the same precision."
+                        )
             if is_layer_skipped(
                 prefix,
                 self.modules_to_not_convert,

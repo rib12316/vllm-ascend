@@ -137,9 +137,12 @@ class AscendW4A16AWQLinearScheme(AscendLinearScheme):
 
         Both are packed along dim=1 (output dimension) with pack_factor=8.
         """
-        if input_size % self.group_size != 0:
-            raise ValueError(f"AWQ input_size ({input_size}) must be divisible by group_size ({self.group_size}).")
-        num_groups = input_size // self.group_size
+        if self.group_size == -1:
+            num_groups = 1  # per-channel: one scale per output channel
+        else:
+            if input_size % self.group_size != 0:
+                raise ValueError(f"AWQ input_size ({input_size}) must be divisible by group_size ({self.group_size}).")
+            num_groups = input_size // self.group_size
         return {
             "qweight": torch.empty(input_size, output_size // self.pack_factor, dtype=torch.int32),
             "qzeros": torch.empty(num_groups, output_size // self.pack_factor, dtype=torch.int32),
@@ -155,9 +158,12 @@ class AscendW4A16AWQLinearScheme(AscendLinearScheme):
         self, input_size: int, output_size: int, params_dtype: torch.dtype, layer_type: str | None = None
     ) -> dict[str, Any]:
         """Return scales specification (no packing, but needs custom dims)."""
-        if input_size % self.group_size != 0:
-            raise ValueError(f"AWQ input_size ({input_size}) must be divisible by group_size ({self.group_size}).")
-        num_groups = input_size // self.group_size
+        if self.group_size == -1:
+            num_groups = 1  # per-channel: one scale per output channel
+        else:
+            if input_size % self.group_size != 0:
+                raise ValueError(f"AWQ input_size ({input_size}) must be divisible by group_size ({self.group_size}).")
+            num_groups = input_size // self.group_size
         return {
             "scales": torch.empty(num_groups, output_size, dtype=params_dtype),
             "_param_dims": {
@@ -211,7 +217,7 @@ class AscendW4A16AWQLinearScheme(AscendLinearScheme):
             qweight,
             antiquant_scale=layer.scales,
             antiquant_offset=layer.qzeros,
-            antiquant_group_size=self.group_size,
+            antiquant_group_size=0 if self.group_size == -1 else self.group_size,
             bias=bias,
         )
         out_shape = x.shape[:-1] + (qweight.shape[-1] * self.pack_factor,)
@@ -276,6 +282,11 @@ class AscendW4A16AWQFusedMoEMethod(AscendMoEScheme):
         hidden_sizes: int,
         params_dtype: torch.dtype,
     ) -> dict[str, Any]:
+        if self.group_size <= 0:
+            raise NotImplementedError(
+                f"AWQ MoE per-channel (group_size={self.group_size}) is not supported on "
+                f"Ascend NPU. Use a positive group_size (e.g. 128)."
+            )
         if intermediate_size_per_partition % self.group_size != 0:
             raise ValueError(
                 f"AWQ MoE intermediate_size_per_partition "
@@ -410,6 +421,7 @@ class AscendW4A16AWQFusedMoEMethod(AscendMoEScheme):
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             num_experts=num_experts,
+            tid2eid=tid2eid,
         )
 
         topk_ids = topk_ids.to(torch.int32)

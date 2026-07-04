@@ -126,8 +126,9 @@ class TestGroupSizeValidation:
     def test_awq_group_size_negative_rejected(self):
         from vllm_ascend.quantization.awq_config import AWQConfig
 
+        # group_size=-1 is per-channel (allowed); any other negative is rejected.
         with pytest.raises(ValueError, match="positive"):
-            AWQConfig(weight_bits=4, group_size=-1, zero_point=True)
+            AWQConfig(weight_bits=4, group_size=-2, zero_point=True)
 
     def test_gptq_group_size_zero_rejected(self):
         from vllm_ascend.quantization.gptq_config import GPTQConfig
@@ -138,8 +139,9 @@ class TestGroupSizeValidation:
     def test_gptq_group_size_negative_rejected(self):
         from vllm_ascend.quantization.gptq_config import GPTQConfig
 
+        # group_size=-1 is per-channel (allowed); any other negative is rejected.
         with pytest.raises(ValueError, match="positive"):
-            GPTQConfig(weight_bits=4, group_size=-1, desc_act=False)
+            GPTQConfig(weight_bits=4, group_size=-2, desc_act=False)
 
     def test_awq_linear_alignment_get_weight(self):
         # input_size not divisible by group_size -> ValueError in get_weight.

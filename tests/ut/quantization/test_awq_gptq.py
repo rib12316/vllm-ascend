@@ -721,5 +721,149 @@ class TestGPTQPergroupSpecValidation:
             )
 
 
+class TestNegativeMoEScale:
+    """Tests for _handle_negative_moe_scale (GPTQ MoE negative-scale absorption).
+
+    NPU op computes ``(w + offset) * scale``. Where ``scale < 0``, negate weight
+    AND offset and take ``abs(scale)`` — this keeps the product equal (SGLang
+    #16364 omits the offset negation; we add it for full correctness). Pure CPU.
+    """
+
+    def test_all_positive_is_noop(self):
+        from vllm_ascend.quantization.methods.gptq import _handle_negative_moe_scale
+
+        unpacked = torch.randint(-8, 7, (2, 64, 32))
+        scales = torch.rand(2, 2, 32) + 0.01  # all positive, gs=32 -> K//gs=2
+        offset = torch.randn(2, 2, 32)
+        out_w, out_o, out_s = _handle_negative_moe_scale(unpacked, offset, scales, 32, 4)
+        assert torch.equal(out_w, unpacked)
+        assert torch.equal(out_o, offset)
+        assert torch.equal(out_s, scales)
+
+    def test_negative_scale_negates_weight_and_offset(self):
+        from vllm_ascend.quantization.methods.gptq import _handle_negative_moe_scale
+
+        # E=1, K=64, N=4, gs=32 -> scales/offset (1, 2, 4)
+        unpacked = torch.full((1, 64, 4), 3.0)
+        offset = torch.full((1, 2, 4), 1.0)
+        scales = torch.tensor([[[1.0, 1, 1, 1], [-2.0, 1, 1, 1]]])  # group 1 col 0 neg
+        out_w, out_o, out_s = _handle_negative_moe_scale(unpacked, offset, scales, 32, 4)
+        assert out_w[0, 32, 0] == -3  # weight negated at group 1 col 0
+        assert out_w[0, 0, 0] == 3  # group 0 col 0 unchanged
+        assert out_o[0, 1, 0] == -1.0  # offset negated at group 1 col 0
+        assert out_o[0, 0, 0] == 1.0  # group 0 col 0 offset unchanged
+        assert out_s[0, 1, 0] == 2.0  # abs
+        assert out_s[0, 0, 0] == 1.0
+
+    def test_mathematical_equivalence(self):
+        """(w+off)*scale == (neg_w+neg_off)*abs(scale) where scale<0."""
+        from vllm_ascend.quantization.methods.gptq import _handle_negative_moe_scale
+
+        torch.manual_seed(0)
+        # randint(-7,7) -> values in [-7,6]; neg lands in [-6,7], all within the
+        # 4-bit clamp range [-8,7], so no clamp truncation and equality is exact.
+        # (clamp truncation at the -8 boundary is covered by test_8bit_clamp_range.)
+        unpacked = torch.randint(-7, 7, (1, 64, 4)).float()
+        scales = torch.randn(1, 2, 4) * 2  # contains negatives, gs=32
+        offset = torch.randn(1, 2, 4)
+        scale_exp = scales.repeat_interleave(32, dim=1)
+        off_exp = offset.repeat_interleave(32, dim=1)
+        ref = (unpacked + off_exp) * scale_exp
+        out_w, out_o, out_s = _handle_negative_moe_scale(unpacked.clone(), offset.clone(), scales.clone(), 32, 4)
+        got = (out_w + out_o.repeat_interleave(32, dim=1)) * out_s.repeat_interleave(32, dim=1)
+        torch.testing.assert_close(got, ref)
+
+    def test_8bit_clamp_range(self):
+        """8-bit weight negated then clamped to [-128, 127]. -(-128)=128 -> 127."""
+        from vllm_ascend.quantization.methods.gptq import _handle_negative_moe_scale
+
+        unpacked = torch.full((1, 32, 4), -128.0)
+        offset = torch.zeros(1, 1, 4)
+        scales = torch.tensor([[[-1.0, 1, 1, 1]]])  # group 0 col 0 neg, gs=32
+        out_w, _, _ = _handle_negative_moe_scale(unpacked, offset, scales, 32, 8)
+        assert out_w[0, 0, 0] == 127  # -(-128)=128 clamped to 127
+
+
+class TestPerChannelGroupSize:
+    """Per-channel quantization (group_size=-1) support for AWQ/GPTQ Linear.
+
+    The NPU fused op accepts antiquant_group_size=0 (per-channel); we map
+    group_size=-1 (upstream's per-channel convention) to it, with scales shape
+    (1, N). Pure CPU shape/routing test.
+    """
+
+    def test_gptq_config_accepts_per_channel(self):
+        from vllm_ascend.quantization.gptq_config import GPTQConfig
+
+        cfg = GPTQConfig(weight_bits=4, group_size=-1, desc_act=False)
+        assert cfg.group_size == -1
+
+    def test_gptq_config_rejects_zero(self):
+        from vllm_ascend.quantization.gptq_config import GPTQConfig
+
+        with pytest.raises(ValueError):
+            GPTQConfig(weight_bits=4, group_size=0, desc_act=False)
+
+    def test_gptq_pergroup_spec_per_channel_shape(self):
+        from vllm_ascend.quantization.methods.gptq import _get_gptq_linear_pergroup_spec
+
+        spec = _get_gptq_linear_pergroup_spec(256, 64, -1, 8, torch.float16)
+        assert spec["scales"].shape == (1, 64)  # per-channel: 1 group
+        assert spec["qzeros"].shape == (1, 64 // 8)
+
+    def test_awq_config_accepts_per_channel(self):
+        from vllm_ascend.quantization.awq_config import AWQConfig
+
+        cfg = AWQConfig(weight_bits=4, group_size=-1, zero_point=True)
+        assert cfg.group_size == -1
+
+    def test_awq_get_weight_per_channel_shape(self):
+        from vllm_ascend.quantization.awq_config import AWQConfig
+        from vllm_ascend.quantization.methods.w4a16_awq import AscendW4A16AWQLinearScheme
+
+        cfg = AWQConfig(weight_bits=4, group_size=-1, zero_point=True)
+        scheme = AscendW4A16AWQLinearScheme(cfg)
+        w = scheme.get_weight(input_size=256, output_size=64, params_dtype=torch.float16)
+        assert w["qzeros"].shape == (1, 64 // 8)
+        pg = scheme.get_pergroup_param(input_size=256, output_size=64, params_dtype=torch.float16)
+        assert pg["scales"].shape == (1, 64)
+
+
+class TestFusedShardConsistency:
+    """Fused layer (gate_up_proj/qkv_proj) shards must share quantization state.
+
+    Upstream alignment (gptq_utils.is_layer_gptq_quantized): mixed
+    quantized/unquantized shards of a fused layer raise. Pure CPU routing test.
+    """
+
+    def test_gptq_mixed_shards_raise(self):
+        from unittest.mock import MagicMock
+
+        from vllm.model_executor.layers.linear import LinearBase
+
+        from vllm_ascend.quantization.gptq_config import GPTQConfig
+
+        cfg = GPTQConfig(weight_bits=4, group_size=128, desc_act=False)
+        cfg.modules_in_block_to_quantize = ["model.layers.0.mlp.gate_proj"]
+        cfg.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+        layer = MagicMock(spec=LinearBase)
+        with pytest.raises(ValueError, match="same precision"):
+            cfg.get_quant_method(layer, "model.layers.0.mlp.gate_up_proj")
+
+    def test_awq_mixed_shards_raise(self):
+        from unittest.mock import MagicMock
+
+        from vllm.model_executor.layers.linear import LinearBase
+
+        from vllm_ascend.quantization.awq_config import AWQConfig
+
+        cfg = AWQConfig(weight_bits=4, group_size=128, zero_point=True)
+        cfg.modules_to_not_convert = ["model.layers.0.mlp.gate_proj"]
+        cfg.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+        layer = MagicMock(spec=LinearBase)
+        with pytest.raises(ValueError, match="same precision"):
+            cfg.get_quant_method(layer, "model.layers.0.mlp.gate_up_proj")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
