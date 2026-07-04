@@ -179,6 +179,16 @@ def _get_gptq_linear_pergroup_spec(
     """
     if input_size % group_size != 0:
         raise ValueError(f"GPTQ input_size ({input_size}) must be divisible by group_size ({group_size}).")
+    if group_size >= input_size:
+        # NPU op npu_weight_quant_batchmatmul requires antiquant_group_size
+        # ∈ {0} ∪ [32, K-1]; group_size == K (the only reachable case here,
+        # since input_size % group_size == 0 is checked above) is rejected at
+        # forward with an opaque error. Reject up front with a clear message.
+        raise ValueError(
+            f"GPTQ group_size ({group_size}) must be < input_size ({input_size}); "
+            f"the NPU fused op rejects antiquant_group_size == K. Use a smaller "
+            f"group_size (e.g. 128)."
+        )
     num_groups = input_size // group_size
     return {
         "scales": torch.empty(num_groups, output_size, dtype=params_dtype),

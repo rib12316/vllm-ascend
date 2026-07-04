@@ -37,7 +37,7 @@ export LD_LIBRARY_PATH="$ASCEND_CUSTOM_OPP_PATH/op_api/lib:$PWD/vllm_ascend:${LD
 
 step() { printf '\n========== %s ==========\n' "$1"; }
 
-step "1/5 unit tests (109)"
+step "1/5 unit tests (137 AWQ/GPTQ-specific; 165 on full fusion branch)"
 python -m pytest tests/quantization/test_awq_gptq.py tests/quantization/test_moe_synthetic_npu.py \
                  tests/quantization/test_quant_routing.py tests/ut/quantization/test_method_adapters.py -q
 

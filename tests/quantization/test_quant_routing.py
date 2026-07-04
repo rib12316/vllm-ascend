@@ -921,5 +921,81 @@ class TestGGUFRouting:
             cfg.get_quant_method(MagicMock(spec=FusedMoE), prefix="moe")
 
 
+# ---------------------------------------------------------------------------
+# F1: AWQ lm_head_quantized routing (mirrors GPTQ T14)
+# ---------------------------------------------------------------------------
+
+
+class TestAWQLMHeadRouting:
+    """AWQ lm_head_quantized mirrors GPTQ T14 — ParallelLMHead routes to the
+    AWQ quant branch when True, stays unquantized (None) when False."""
+
+    def test_lm_head_false_leaves_unquantized(self):
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            ParallelLMHead,
+        )
+
+        from vllm_ascend.quantization.awq_config import AWQConfig
+
+        cfg = AWQConfig(weight_bits=4, group_size=128, zero_point=True, lm_head_quantized=False)
+        method = cfg.get_quant_method(MagicMock(spec=ParallelLMHead), prefix="lm_head")
+        assert method is None, f"lm_head_quantized=False must leave ParallelLMHead unquantized, got {type(method)!r}"
+
+    def test_lm_head_true_routes_to_awq(self):
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            ParallelLMHead,
+        )
+
+        from vllm_ascend.quantization.awq_config import AWQConfig
+        from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+
+        cfg = AWQConfig(weight_bits=4, group_size=128, zero_point=True, lm_head_quantized=True)
+        method = cfg.get_quant_method(MagicMock(spec=ParallelLMHead), prefix="lm_head")
+        assert isinstance(method, AscendLinearMethod), (
+            f"lm_head_quantized=True must route ParallelLMHead to AWQ quant, got {type(method)!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# torchao int4 self-impl math (H1: group_size >= K, zero-group guard)
+# ---------------------------------------------------------------------------
+
+
+class TestTorchAOInt4Math:
+    """CPU math tests for the self-implemented per-group int4 RTN
+    (``_int4_symmetric_quant``) — validates H1 (group_size >= K pre-rejection)
+    and the all-zero-group div-by-zero guard."""
+
+    def test_int4_group_size_ge_input_size_rejected(self):
+        # H1: NPU op rejects antiquant_group_size == K; reject at load.
+        import pytest
+
+        from vllm_ascend.quantization.methods.torchao import _int4_symmetric_quant
+
+        W = torch.randn(64, 128, dtype=torch.float32)  # [N, K] with K=128
+        with pytest.raises(ValueError, match="must be < input_size"):
+            _int4_symmetric_quant(W, group_size=128)  # group_size == K
+
+    def test_int4_all_zero_group_no_nan(self):
+        # max_abs=0 for an all-zero group; the clamp(min=1e-8) guard must
+        # avoid div-by-zero NaN.
+        from vllm_ascend.quantization.methods.torchao import _int4_symmetric_quant
+
+        W = torch.zeros(64, 256, dtype=torch.float32)
+        q_flat, scales = _int4_symmetric_quant(W, group_size=128)
+        assert not torch.isnan(q_flat).any()
+        assert not torch.isnan(scales).any()
+        assert torch.all(q_flat == 0)  # zero weight -> zero quantized
+
+    def test_int4_valid_group_size_accepted(self):
+        from vllm_ascend.quantization.methods.torchao import _int4_symmetric_quant
+
+        W = torch.randn(64, 256, dtype=torch.float32)  # K=256, group=128 < K
+        q_flat, scales = _int4_symmetric_quant(W, group_size=128)
+        assert q_flat.shape == (256, 64)  # [K, N]
+        assert scales.shape == (2, 64)  # [G, N], G = 256 // 128
+        assert q_flat.min() >= -8 and q_flat.max() <= 7
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

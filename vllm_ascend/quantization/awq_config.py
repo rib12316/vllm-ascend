@@ -70,6 +70,7 @@ class AWQConfig(QuantizationConfig):
         zero_point: bool,
         modules_to_not_convert: list[str] | None = None,
         quant_config: dict[str, Any] | None = None,
+        lm_head_quantized: bool = False,
     ):
         self.quant_description = quant_config if quant_config is not None else {}
         super().__init__()
@@ -78,6 +79,7 @@ class AWQConfig(QuantizationConfig):
         self.group_size = group_size
         self.zero_point = zero_point
         self.modules_to_not_convert = modules_to_not_convert or []
+        self.lm_head_quantized = lm_head_quantized
 
         if self.group_size <= 0:
             raise ValueError(
@@ -116,7 +118,15 @@ class AWQConfig(QuantizationConfig):
         group_size = cls.get_from_keys(config, ["q_group_size", "group_size"])
         zero_point = cls.get_from_keys(config, ["zero_point"])
         modules_to_not_convert = cls.get_from_keys_or(config, ["modules_to_not_convert"], None)
-        return cls(weight_bits, group_size, zero_point, modules_to_not_convert, config)
+        lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
+        return cls(
+            weight_bits,
+            group_size,
+            zero_point,
+            modules_to_not_convert,
+            config,
+            lm_head_quantized=lm_head_quantized,
+        )
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
         """Translate HF module names in modules_to_not_convert to vLLM names.
@@ -159,13 +169,26 @@ class AWQConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str, tid2eid: dict[int, int] | None = None
     ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
-        if isinstance(layer, LinearBase):
+        # Handle lm_head: ParallelLMHead is NOT a LinearBase subclass, so we
+        # must explicitly check it when lm_head_quantized=True (mirrors GPTQ
+        # T14). When False, fall through to ``return None`` so vLLM leaves the
+        # embedding head unquantized.
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            ParallelLMHead,
+            UnquantizedEmbeddingMethod,
+        )
+
+        parallel_lm_head_quantized = isinstance(layer, ParallelLMHead) and self.lm_head_quantized
+
+        if isinstance(layer, LinearBase) or parallel_lm_head_quantized:
             if is_layer_skipped(
                 prefix,
                 self.modules_to_not_convert,
                 self.packed_modules_mapping,
                 skip_with_substr=True,
             ):
+                if parallel_lm_head_quantized:
+                    return UnquantizedEmbeddingMethod()
                 return AscendUnquantizedLinearMethod()
             # Ascend Scheme 框架: lookup scheme from registry and wrap with adapter
             scheme_cls = get_scheme_class("W4A16_AWQ", "linear")

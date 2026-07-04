@@ -210,6 +210,27 @@ def test_q5_repack_forces_cpu_no_npu_bitop():
     assert offset.abs().sum().item() == 0.0  # Q5_0 is symmetric
 
 
+def test_q8_0_repack_matches_dequant():
+    # Q8_0 high-perf repack (int8 path) must reconstruct dequant — closes the
+    # Q8_0 gap (previously only its dequant was tested, not the repack).
+    block = _q8_0_block(2.0, torch.randint(0, 256, (32,)).to(torch.uint8))
+    ref = dequantize(block, WT.Q8_0, torch.float32)  # [1, 32]
+    qw, scale, offset, _group = repack_to_npu(block, WT.Q8_0, torch.float16)
+    recon = (qw.to(torch.float32) + offset.to(torch.float32)) * scale.to(torch.float32)
+    torch.testing.assert_close(recon.t().contiguous(), ref, rtol=1e-3, atol=1e-3)
+
+
+def test_partial_block_bytes_rejected():
+    # H3: bytes/row not divisible by type_size must raise a clear ValueError
+    # instead of silently dropping data in the kernel's reshape.
+    import pytest
+
+    block = _q8_0_block(2.0, torch.arange(32, dtype=torch.uint8))  # [1, 34]
+    truncated = block[:, :-1]  # [1, 33]; 33 % 34 != 0
+    with pytest.raises(ValueError, match="divisible by the block type_size"):
+        dequantize(truncated, WT.Q8_0, torch.float32)
+
+
 def test_q4_k_dequant_sections():
     # Degenerate: all 6-bit scales=1, mins=0; dall=2, dmin=0; qs byte=0x13 (low=3, high=1).
     # Each low section = dall*1*3 = 6, each high section = dall*1*1 = 2.

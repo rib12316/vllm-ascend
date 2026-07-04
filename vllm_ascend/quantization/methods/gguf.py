@@ -123,6 +123,13 @@ class AscendGGUFLinearMethod(LinearMethodBase):
             shard_ids = qweight.shard_id
             if "q" in shard_ids:  # QKV: loader order can be ['k','q','v'] → [q,k,v]
                 shard_ids = ["q", "k", "v"]
+            missing = [sid for sid in shard_ids if sid not in qweight.shard_id_map]
+            if missing:
+                raise ValueError(
+                    f"GGUF shard(s) {missing} not found in shard_id_map (have "
+                    f"{list(qweight.shard_id_map.keys())}); the checkpoint's "
+                    f"shard layout is unexpected."
+                )
             shard_specs = [
                 (
                     data_container[qweight.shard_id_map[sid]].cpu(),

@@ -236,7 +236,9 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         # FusedMoE weight_loader shards gate/up (w1/w3) along the output dim
         # consistently. Previously only qweight had is_transposed; scales/qzeros
         # used shard_dim=0 and loaded wrong (w13 qzeros gate-half-only,
-        # qzeros effectively zero -> Bug#6: degenerate MoE output).
+        # qzeros effectively zero -> degenerate MoE output). This is the
+        # MoE-qzeros is_transposed fix (doc: 项目任务书 §6.2 note), distinct
+        # from the Linear pwal bug that is also historically called "Bug#6".
         extra_weight_attrs["is_transposed"] = True
         weight_param = self.quant_method.get_weight(
             num_experts, intermediate_size_per_partition, hidden_size, params_dtype

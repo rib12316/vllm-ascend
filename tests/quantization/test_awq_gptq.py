@@ -672,6 +672,13 @@ class TestNPUOperatorIntegration:
     @pytest.fixture(autouse=True)
     def skip_without_npu(self):
         pytest.importorskip("torch_npu", reason="torch_npu not available")
+        # Probe the actual tensor method: under TORCH_DEVICE_BACKEND_AUTOLOAD=0
+        # the torch_npu package imports and torch.npu.is_available() can return
+        # True, but the ``.npu()`` tensor method isn't registered — so the test
+        # would AttributeError instead of skip. Require both the namespace and
+        # the tensor method.
+        if not hasattr(torch, "npu") or not hasattr(torch.Tensor, "npu"):
+            pytest.skip("No NPU device available")
         if not torch.npu.is_available():
             pytest.skip("No NPU device available")
 
@@ -712,6 +719,64 @@ class TestNPUOperatorIntegration:
         packed = torch_npu.npu_convert_weight_to_int4pack(weight_int32)
         assert packed is not None
         assert packed.is_npu
+
+
+# ---------------------------------------------------------------------------
+# GPTQ pergroup-spec validation (H1: group_size >= input_size pre-rejection)
+# ---------------------------------------------------------------------------
+
+
+class TestGPTQPergroupSpecValidation:
+    """H1 regression: the NPU fused op rejects ``antiquant_group_size == K``;
+    reject it at load (``_get_gptq_linear_pergroup_spec``) with a clear error
+    instead of an opaque forward-time crash.
+    """
+
+    def test_group_size_equals_input_size_rejected(self):
+        from vllm_ascend.quantization.methods.gptq import (
+            _get_gptq_linear_pergroup_spec,
+        )
+
+        # input_size % group_size == 0 passes the first check; the second
+        # check (group_size >= input_size) must raise. This is the only
+        # reachable case (group_size > input_size would fail divisibility).
+        with pytest.raises(ValueError, match="must be < input_size"):
+            _get_gptq_linear_pergroup_spec(
+                input_size=128,
+                output_size=64,
+                group_size=128,
+                pack_factor=8,
+                params_dtype=torch.float16,
+            )
+
+    def test_group_size_smaller_than_input_size_accepted(self):
+        from vllm_ascend.quantization.methods.gptq import (
+            _get_gptq_linear_pergroup_spec,
+        )
+
+        spec = _get_gptq_linear_pergroup_spec(
+            input_size=256,
+            output_size=64,
+            group_size=128,
+            pack_factor=8,
+            params_dtype=torch.float16,
+        )
+        assert spec["scales"].shape == (2, 64)  # num_groups = 256 // 128 = 2
+        assert spec["qzeros"].shape == (2, 64 // 8)  # (num_groups, N // pack_factor)
+
+    def test_misaligned_group_size_rejected(self):
+        from vllm_ascend.quantization.methods.gptq import (
+            _get_gptq_linear_pergroup_spec,
+        )
+
+        with pytest.raises(ValueError, match="divisible by group_size"):
+            _get_gptq_linear_pergroup_spec(
+                input_size=100,
+                output_size=64,
+                group_size=128,
+                pack_factor=8,
+                params_dtype=torch.float16,
+            )
 
 
 if __name__ == "__main__":

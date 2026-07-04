@@ -119,6 +119,16 @@ def _int4_symmetric_quant(
     N, K = weight_nk.shape
     if K % group_size != 0:
         raise ValueError(f"int4wo input_size ({K}) must be divisible by group_size ({group_size}).")
+    if group_size >= K:
+        # NPU op npu_weight_quant_batchmatmul requires antiquant_group_size
+        # ∈ {0} ∪ [32, K-1]; group_size == K (the only reachable case since
+        # K % group_size == 0 is checked above) is rejected at forward with an
+        # opaque error. Reject up front at load time with a clear message.
+        raise ValueError(
+            f"int4wo group_size ({group_size}) must be < input_size ({K}); the "
+            f"NPU fused op rejects group_size == K. Use a smaller group_size "
+            f"(e.g. 128) or a per-channel int8wo path."
+        )
     num_groups = K // group_size
 
     w = weight_nk.detach().to(torch.float32).reshape(N, num_groups, group_size)
