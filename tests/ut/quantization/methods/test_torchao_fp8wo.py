@@ -22,7 +22,7 @@ the whole scheme is CPU-runnable (no NPU). These tests verify the load-time
 fp8 round-trip and that ``apply`` matches a dense reference matmul.
 
 Usage:
-    pytest tests/quantization/test_torchao_fp8wo_cpu.py -v
+    pytest tests/ut/quantization/methods/test_torchao_fp8wo.py -v
 """
 
 from unittest.mock import MagicMock

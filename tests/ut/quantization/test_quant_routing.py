@@ -28,7 +28,7 @@ These tests cover the "implemented but not NPU-verified" config features
 - T16: AWQ/GPTQ maybe_update_config auto-detection from safetensors metadata
 
 Usage:
-    pytest tests/quantization/test_quant_routing.py -v
+    pytest tests/ut/quantization/test_quant_routing.py -v
 """
 
 import glob
