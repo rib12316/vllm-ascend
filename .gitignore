@@ -223,3 +223,6 @@ csrc/third_party/
 # Local CANN installs / download artifacts (not part of repo)
 usr/
 csrc/build_out/
+
+# CANN runtime data-dump (aclnn exception/.o), never track
+extra-info/
