@@ -28,7 +28,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 
-from .base import AscendMoEScheme, QuantType, get_moe_num_logical_experts
+from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
 
 
@@ -362,3 +362,142 @@ class AscendW4A16FusedMoEMethod(AscendMoEScheme):
 
         layer.w13_weight_offset.data = layer.w13_weight_offset.data.transpose(1, 2).contiguous()
         layer.w2_weight_offset.data = layer.w2_weight_offset.data.transpose(1, 2).contiguous()
+
+
+@register_scheme("W4A16", "linear")
+class AscendW4A16LinearScheme(AscendLinearScheme):
+    """Linear scheme for Ascend W4A16 compressed-tensors int4 weight-only quant.
+
+    Linear counterpart of :class:`AscendW4A16FusedMoEMethod`. Consumes
+    LLM-Compressor / compressed-tensors int4 weight-only checkpoints (the
+    layout also produced for dense models, e.g. an LLM-Compressor W4A16
+    Llama). Per-layer tensors (``L`` = layer index):
+
+    - ``model.layers.L.<proj>.weight_packed``: ``torch.int32``,
+      ``[output_size, input_size // pack_factor]``, packed along the input
+      dim (``packed_dim=1``, ``pack_factor=8`` — eight 4-bit values per int32).
+    - ``model.layers.L.<proj>.weight_scale``: ``torch.bfloat16``/``fp16``,
+      ``[output_size, input_size // group_size]`` (GROUP strategy).
+    - ``model.layers.L.<proj>.weight_shape``: ``torch.int32``, ``[2]`` — the
+      original ``[input_size, output_size]`` (metadata; derived from the
+      packed tensor at load time so it stays correct under tensor parallel).
+
+    The quantization is assumed **symmetric** (no ``weight_zero_point``), so
+    the antiquant offset is all zeros — matching the MoE scheme. Asymmetric
+    support is deferred until a real asymmetric compressed-tensors int4
+    checkpoint surfaces.
+
+    In :meth:`process_weights_after_loading`, ``weight_packed`` is unpacked to
+    signed int4 ``[output, input]``, transposed to ``[input, output]`` (the
+    ``(K, N)`` layout the NPU op expects, identical to the GPTQ linear path),
+    and repacked via :func:`torch_npu.npu_convert_weight_to_int4pack`; the
+    per-group scale is transposed to ``[input // group_size, output]`` and a
+    zero offset of the same shape is constructed. :meth:`apply` then calls
+    ``npu_weight_quant_batchmatmul`` with ``antiquant_group_size = group_size``.
+    """
+
+    def __init__(self) -> None:
+        self.num_bits = 4  # dtype = torch.int4
+        self.pack_factor = 32 // self.num_bits  # 8: pack 8 int4 values into one int32
+        vllm_config = get_current_vllm_config()
+        self.group_size = vllm_config.quant_config.quant_description.get("group_size", 32)
+
+    def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
+        """Return ``weight_packed`` and ``weight_shape`` specifications.
+
+        ``weight_packed`` is packed along the input dim (dim 1); ``weight_shape``
+        is metadata and must neither be packed nor sharded.
+        """
+        assert input_size % self.pack_factor == 0, (
+            f"Expecting `input_size` {input_size} can be divided by `pack_factor` {self.pack_factor}"
+        )
+        return {
+            "weight_packed": torch.empty(output_size, input_size // self.pack_factor, dtype=torch.int32),
+            "weight_shape": torch.empty(2, dtype=torch.int32),
+            "_packed_dim": 1,
+            "_packed_factor": self.pack_factor,
+            "_param_dims": {
+                "weight_packed": {"input_dim": 1, "output_dim": 0},
+                # weight_shape is [2] metadata — no input/output dim attrs, no sharding
+                "weight_shape": {},
+            },
+            "_unpacked_params": {"weight_shape"},
+        }
+
+    def get_pergroup_param(
+        self, input_size: int, output_size: int, params_dtype: torch.dtype, layer_type: str | None = None
+    ) -> dict[str, Any]:
+        """Return the per-group ``weight_scale`` specification.
+
+        Scale is stored ``[output, input // group_size]`` (output on dim 0,
+        input on dim 1) — the compressed-tensors convention, the transpose of
+        the GPTQ layout.
+        """
+        assert self.group_size > 0, (
+            "compressed-tensors W4A16 linear requires a positive group_size; "
+            "per-channel (group_size=-1) is not supported."
+        )
+        assert input_size % self.group_size == 0, (
+            f"Expecting `input_size` {input_size} can be divided by `group_size` {self.group_size}"
+        )
+        return {
+            "weight_scale": torch.empty(output_size, input_size // self.group_size, dtype=params_dtype),
+            "_param_dims": {
+                "weight_scale": {"input_dim": 1, "output_dim": 0},
+            },
+        }
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Unpack → transpose to (K, N) → repack for the NPU op; build zero offset."""
+        weight_packed = layer.weight_packed.data  # [output, input // pack_factor] int32
+        out_features = weight_packed.shape[0]
+        # Derive dims from the loaded (post-shard) tensor rather than weight_shape
+        # so tensor-parallel sharding stays correct. pack_factor | input_size ⇒ exact.
+        in_features = weight_packed.shape[1] * self.pack_factor
+
+        # Unpack to signed int8 [output, input] (centers uint4 [0..15] → [-8..7]).
+        unpacked = unpack_from_int32(
+            weight_packed,
+            torch.Size([out_features, in_features]),
+            self.num_bits,
+        )
+        # Transpose to [input, output] = (K, N) — the layout the NPU op consumes
+        # (matches the GPTQ linear path) — and repack via the NPU int4 pack op.
+        unpacked_kn = unpacked.transpose(0, 1).contiguous().to(torch.int32)
+        packed = torch_npu.npu_convert_weight_to_int4pack(unpacked_kn)
+        layer.weight_packed = torch.nn.Parameter(packed.contiguous(), requires_grad=False)
+        # After int4pack the last dim is no longer N; save the true output size.
+        layer.w4a16_output_size = out_features
+
+        # Scale [output, input // group_size] → [input // group_size, output] = (K//gs, N)
+        layer.weight_scale = torch.nn.Parameter(
+            layer.weight_scale.data.transpose(0, 1).contiguous(),
+            requires_grad=False,
+        )
+        # Symmetric quantization ⇒ zero antiquant offset, same shape as the scale.
+        layer.weight_offset = torch.nn.Parameter(
+            torch.zeros_like(layer.weight_scale.data),
+            requires_grad=False,
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        tp_rank: int | None = 0,
+    ) -> torch.Tensor:
+        """Forward pass using ``npu_weight_quant_batchmatmul``."""
+        if bias is not None and bias.dtype == torch.bfloat16:
+            bias = bias.float()
+        reshaped_x = x.reshape(-1, x.shape[-1])
+        out = torch_npu.npu_weight_quant_batchmatmul(
+            reshaped_x,
+            layer.weight_packed,
+            antiquant_scale=layer.weight_scale,
+            antiquant_offset=layer.weight_offset,
+            antiquant_group_size=self.group_size,
+            bias=bias,
+        )
+        out_shape = x.shape[:-1] + (layer.w4a16_output_size,)
+        return out.reshape(out_shape)

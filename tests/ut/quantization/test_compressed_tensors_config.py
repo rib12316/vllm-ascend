@@ -74,6 +74,31 @@ class TestAscendCompressedTensorsQuanType(TestBase):
         with self.assertRaises(NotImplementedError):
             self.config._detect_quant_type(weight, input_q, "int_quantized")
 
+    def test_create_scheme_w4a16_linear_resolves_to_ascend_scheme(self):
+        """AG10 Linear gap closure: _create_scheme_for_layer_type now resolves
+        a compressed-tensors int4 weight-only (W4A16) linear layer to
+        AscendW4A16LinearScheme via the real registry. Previously
+        get_scheme_class("W4A16", "linear") returned None, so a dense
+        compressed-tensors int4 checkpoint raised NotImplementedError on every
+        linear layer.
+        """
+        from compressed_tensors.quantization import QuantizationType
+
+        from vllm_ascend.quantization.methods.w4a16 import AscendW4A16LinearScheme
+
+        weight = MagicMock()
+        weight.num_bits = 4
+        weight.strategy = "group"
+        weight.dynamic = False
+        weight.symmetric = True
+        weight.type = QuantizationType.INT
+        # AscendW4A16LinearScheme.__init__ reads group_size from the live vllm
+        # config; mock it so the test doesn't depend on a running engine.
+        with patch("vllm_ascend.quantization.methods.w4a16.get_current_vllm_config") as mock_vllm:
+            mock_vllm.return_value.quant_config.quant_description.get.return_value = 32
+            scheme = self.config._create_scheme_for_layer_type(weight, None, None, "linear")
+        self.assertIsInstance(scheme, AscendW4A16LinearScheme)
+
 
 class TestAscendCompressedTensorsConfigGetQuantMethod(TestBase):
     def setUp(self):
