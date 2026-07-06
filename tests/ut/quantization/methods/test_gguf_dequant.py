@@ -422,6 +422,54 @@ def test_q3_k_matches_scalar_reference():
     torch.testing.assert_close(vec, ref, rtol=1e-3, atol=1e-3)
 
 
+def test_q4_k_repack_matches_dequant(monkeypatch):
+    # Q4_K high-perf repack (int4-pack, per-32-section scale/offset, group_size=32)
+    # must reconstruct dequant. Random super-block, finite d/dmin, sc forced >=1
+    # (sc==0 is a theoretical edge case absent in real weights: 0/19456 on Qwen Q4_K,
+    # log logs/bench/2026-07-06_q4k-repack-real.log).
+    import struct
+
+    _mock_int4pack_passthrough(monkeypatch)
+    torch.manual_seed(2)
+    raw = torch.randint(0, 256, (144,), dtype=torch.uint8).tolist()
+    raw[0:4] = list(struct.pack("<ee", 1.5, 0.25))  # dall=1.5, dmin=0.25
+    raw[4:8] = [b | 1 for b in raw[4:8]]  # force sc_lo >= 1
+    raw[12:16] = [b | 1 for b in raw[12:16]]  # force sc_hi >= 1
+    block = torch.tensor(raw, dtype=torch.uint8).unsqueeze(0)
+    ref = dequantize(block, WT.Q4_K, torch.float32)  # [1, 256]
+    qw, scale, offset, group = repack_to_npu(block, WT.Q4_K, torch.float16)
+    assert group == 32
+    # scale/offset are [G, N] (G=K/32); expand to [K, N] for elementwise compare.
+    exp_off = offset.repeat_interleave(32, dim=0)
+    exp_sc = scale.repeat_interleave(32, dim=0)
+    recon = (qw.to(torch.float32) + exp_off.to(torch.float32)) * exp_sc.to(torch.float32)
+    # scale/offset are returned as fp16 (what the op consumes); dequant ref is float32,
+    # so allow fp16 precision (the algebra is bit-exact in float32: 5.96e-8 on real Q4_K,
+    # log logs/bench/2026-07-06_q4k-repack-real.log). A real bug is O(1), caught here.
+    torch.testing.assert_close(recon.t().contiguous(), ref, rtol=3e-2, atol=3e-2)
+
+
+def test_q5_k_repack_matches_dequant():
+    # Q5_K high-perf repack (int8 path, 5-bit, per-32-section scale/offset).
+    # Exercises the 5th-bit extraction + the offset=16-dmin*mn/(dall*sc) derivation.
+    import struct
+
+    torch.manual_seed(3)
+    raw = torch.randint(0, 256, (176,), dtype=torch.uint8).tolist()
+    raw[0:4] = list(struct.pack("<ee", 1.5, 0.25))  # dall=1.5, dmin=0.25
+    raw[4:8] = [b | 1 for b in raw[4:8]]
+    raw[12:16] = [b | 1 for b in raw[12:16]]
+    block = torch.tensor(raw, dtype=torch.uint8).unsqueeze(0)
+    ref = dequantize(block, WT.Q5_K, torch.float32)
+    qw, scale, offset, group = repack_to_npu(block, WT.Q5_K, torch.float16)
+    assert group == 32
+    assert qw.dtype == torch.int8  # 5-bit → int8 path (no int4pack)
+    exp_off = offset.repeat_interleave(32, dim=0)
+    exp_sc = scale.repeat_interleave(32, dim=0)
+    recon = (qw.to(torch.float32) + exp_off.to(torch.float32)) * exp_sc.to(torch.float32)
+    torch.testing.assert_close(recon.t().contiguous(), ref, rtol=3e-2, atol=3e-2)
+
+
 if __name__ == "__main__":
     import pytest
 
