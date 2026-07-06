@@ -390,4 +390,15 @@ def dequantize(
         raise NotImplementedError(
             f"GGUF dequant for {WT(qweight_type).name} is not yet implemented on Ascend NPU (supported: {supported})."
         )
+    # Validate byte alignment: each row must hold a whole number of blocks,
+    # else the reshape inside the kernel would silently drop data. Raises a
+    # clear error on truncated/corrupted checkpoints instead.
+    _, type_size = _block_layout(qweight_type)
+    n_bytes = qweight.shape[-1]
+    if n_bytes % type_size != 0:
+        raise ValueError(
+            f"GGUF {WT(qweight_type).name} weight has {n_bytes} bytes/row, not "
+            f"divisible by the block type_size {type_size}; the checkpoint may "
+            f"be truncated or corrupted."
+        )
     return kernel(qweight, dtype)

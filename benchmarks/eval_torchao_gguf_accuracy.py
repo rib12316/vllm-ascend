@@ -80,6 +80,10 @@ CONFIGS = {
         f"{GGUF_DIR}/qwen2.5-0.5b-instruct-q4_k_m.gguf",
         ["--quantization", "gguf", "--load_format", "gguf", "--dtype", "float16"],
     ),
+    "gguf-q5_k_m": (
+        f"{GGUF_DIR}/qwen2.5-0.5b-instruct-q5_k_m.gguf",
+        ["--quantization", "gguf", "--load_format", "gguf", "--dtype", "float16"],
+    ),
 }
 
 SERVED_NAME = "test"
