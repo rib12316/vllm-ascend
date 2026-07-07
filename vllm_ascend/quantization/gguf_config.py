@@ -52,6 +52,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm_ascend.utils import GGUF_QUANTIZATION_METHOD
 
 from .methods.gguf import AscendGGUFEmbeddingMethod, AscendGGUFLinearMethod
+from .methods.gguf_moe import AscendGGUFMoEMethod
 
 
 @register_quantization_config(GGUF_QUANTIZATION_METHOD)
@@ -121,9 +122,12 @@ class GGUFConfig(QuantizationConfig):
                 return UnquantizedEmbeddingMethod()
             return AscendGGUFEmbeddingMethod(self)
         elif isinstance(layer, FusedMoE):
-            # MoE dequant-at-load is G-10; not in the MVP.
-            raise NotImplementedError(
-                "GGUF MoE on Ascend NPU is not yet supported (planned: dequant "
-                "experts → fused_experts). Please use a non-MoE GGUF model."
-            )
+            # torchao-gguf-moe project: route GGUF MoE to AscendGGUFMoEMethod,
+            # which inherits upstream GGUFMoEMethod's create_weights (the
+            # is_gguf_weight sideload contract) and overrides only apply with
+            # Ascend compute. (Architecture A — see methods/gguf_moe.py docstring:
+            # AscendFusedMoEMethod.create_weights re-wraps params and breaks the
+            # GGUFUninitializedParameter sideload, so self-build scheme (B) is
+            # unusable here.)
+            return AscendGGUFMoEMethod(self, layer.moe_config)
         return None
