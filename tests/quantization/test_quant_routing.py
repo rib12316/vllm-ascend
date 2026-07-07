@@ -724,15 +724,20 @@ class TestGGUFRouting:
         cfg = GGUFConfig.from_config({})
         assert cfg.get_quant_method(MagicMock(), prefix="foo") is None
 
-    def test_moe_raises_not_implemented(self):
-        import pytest
+    def test_moe_routes_to_ascend_method(self):
+        # torchao-gguf-moe: FusedMoE routes to AscendGGUFMoEMethod (inherits
+        # upstream GGUFMoEMethod for the is_gguf_weight sideload contract;
+        # overrides apply with Ascend compute).
         from vllm.model_executor.layers.fused_moe import FusedMoE
 
         from vllm_ascend.quantization.gguf_config import GGUFConfig
+        from vllm_ascend.quantization.methods.gguf_moe import AscendGGUFMoEMethod
 
         cfg = GGUFConfig.from_config({})
-        with pytest.raises(NotImplementedError, match="MoE"):
-            cfg.get_quant_method(MagicMock(spec=FusedMoE), prefix="moe")
+        moe = MagicMock(spec=FusedMoE)
+        moe.moe_config = MagicMock()
+        method = cfg.get_quant_method(moe, prefix="moe")
+        assert isinstance(method, AscendGGUFMoEMethod)
 
 
 if __name__ == "__main__":
