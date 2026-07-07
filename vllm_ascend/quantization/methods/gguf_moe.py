@@ -27,9 +27,10 @@ weights to dense fp16 at load (:func:`gguf_dequant.dequantize`, per expert per
 (mirrors upstream ``_fused_moe_gguf``'s slow path, but dense ``F.linear`` / ``@``).
 Correctness milestone + permanent safety net (Fallback-first); NOT memory-saving.
 
-Weight orientation (gguf storage, R7 — verify at real e2e):
-- ``w13 = [E, 2*inter, K]`` is ``[out, in]`` → gate_up = ``F.linear(x, w13[e])``.
-- ``w2  = [E, inter, K]``   is ``[in, out]`` → down    = ``act @ w2[e]``.
+Weight orientation (gguf storage, R7 — SETTLED at real e2e 2026-07-07 against
+SzymonOzog/test-gguf-moe-sample): BOTH are ``[out, in]``, so both use F.linear.
+- ``w13 = [E, 2*inter, H]`` → gate_up = ``F.linear(x, w13[e])`` (H → 2*inter).
+- ``w2  = [E, H, inter]``   → down    = ``F.linear(act, w2[e])`` (inter → H).
 """
 
 import torch
@@ -46,17 +47,17 @@ class AscendGGUFMoEMethod(GGUFMoEMethod):
     def process_weights_after_loading(self, layer: FusedMoE) -> None:
         """Dequantize each expert's gguf-packed weights to dense fp16 at load."""
         dtype = torch.float16
-        w13_q = layer.w13_qweight  # [E, 2*inter, K_bytes]
-        w2_q = layer.w2_qweight  # [E, inter, K_bytes]
+        w13_q = layer.w13_qweight  # [E, 2*inter, H_bytes]
+        w2_q = layer.w2_qweight  # [E, H, inter_bytes]
         qt13 = int(layer.w13_qweight_type.weight_type)
         qt2 = int(layer.w2_qweight_type.weight_type)
         num_experts = w13_q.shape[0]
         layer.w13_weight = torch.stack(
             [dequantize(w13_q[e], qt13, dtype) for e in range(num_experts)]
-        )  # [E, 2*inter, K]  ([out, in])
+        )  # [E, 2*inter, H]  ([out, in])
         layer.w2_weight = torch.stack(
             [dequantize(w2_q[e], qt2, dtype) for e in range(num_experts)]
-        )  # [E, inter, K]  ([in, out])
+        )  # [E, H, inter]  ([out, in])
 
     def apply(
         self,
@@ -71,19 +72,19 @@ class AscendGGUFMoEMethod(GGUFMoEMethod):
         Activation is silu/swiglu (common case; TODO generalize via
         ``layer.activation``). ``shared_experts_input`` ignored (milestone).
         """
-        w13 = layer.w13_weight  # [E, 2*inter, K] ([out, in])
-        w2 = layer.w2_weight  # [E, inter, K] ([in, out])
+        w13 = layer.w13_weight  # [E, 2*inter, H] ([out, in])
+        w2 = layer.w2_weight  # [E, H, inter] ([out, in])
         x = x.to(w13.dtype)
         inter = w13.shape[1] // 2
         out = torch.empty_like(x)
         for tok, (w_row, idx_row) in enumerate(zip(topk_weights, topk_ids)):
-            inp = x[tok]  # [K]
+            inp = x[tok]  # [H]
             cur = None
             for ww, ii in zip(w_row, idx_row):
-                gate_up = F.linear(inp, w13[int(ii)])  # [2*inter] (x @ w13[e].T)
+                gate_up = F.linear(inp, w13[int(ii)])  # [2*inter]
                 gate, up = gate_up[:inter], gate_up[inter:]
                 act_out = F.silu(gate) * up  # swiglu → [inter]
-                down = (act_out @ w2[int(ii)]) * float(ww)  # [K] (act @ w2[e])
+                down = F.linear(act_out, w2[int(ii)]) * float(ww)  # [H]
                 cur = down if cur is None else cur + down
             if cur is None:
                 cur = torch.zeros_like(x[tok])
